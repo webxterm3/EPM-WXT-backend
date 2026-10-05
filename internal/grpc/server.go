@@ -386,6 +386,15 @@ func (s *AgentServer) Stream(stream agentv1.AgentService_StreamServer) error {
 	}
 	defer s.store.UpdateMachineStatus(agentID, "offline", time.Now())
 
+	// Send the tenant's log-collection policy on every connect.
+	//
+	// A machine that was offline when the setting changed would otherwise keep
+	// its old policy indefinitely — including keeping on collecting after the
+	// operator turned collection off, which is the direction that matters.
+	if machineErr == nil && machine != nil {
+		go s.sendLogShipPolicy(conn, machine.TenantID, agentID)
+	}
+
 	// Handle incoming messages from Agent
 	go func() {
 		for {
@@ -530,5 +539,44 @@ func (s *AgentServer) Stream(stream agentv1.AgentService_StreamServer) error {
 		case <-stream.Context().Done():
 			return nil
 		}
+	}
+}
+
+// sendLogShipPolicy delivers the tenant's system-log collection settings to a
+// freshly connected agent.
+//
+// The short delay mirrors the init-script path: the stream's send loop needs a
+// moment to start, and a message queued before it does is dropped.
+func (s *AgentServer) sendLogShipPolicy(conn *AgentConnection, tenantID, agentID string) {
+	time.Sleep(2 * time.Second)
+
+	cfg, err := s.store.GetTenantConfig(tenantID)
+	if err != nil || cfg == nil {
+		return
+	}
+
+	payload, err := json.Marshal(cfg.LogShipping.AgentPayload())
+	if err != nil {
+		s.logger.Error("Log shipping: could not encode the policy", zap.Error(err))
+		return
+	}
+
+	msg := &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_Command{
+			Command: &agentv1.CommandRequest{
+				CommandId: LogShipCommandID,
+				Command:   string(payload),
+			},
+		},
+	}
+
+	select {
+	case conn.InputChan <- msg:
+		s.logger.Debug("Log shipping: policy sent",
+			zap.String("agent_id", agentID),
+			zap.Bool("enabled", cfg.LogShipping.Enabled))
+	default:
+		s.logger.Warn("Log shipping: InputChan full, policy dropped",
+			zap.String("agent_id", agentID))
 	}
 }

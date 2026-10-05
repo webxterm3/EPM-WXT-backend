@@ -76,6 +76,10 @@ func (h *Handler) SaveS3Config(c *gin.Context) {
 
 	cfg := &store.TenantConfig{
 		TenantID: tenantID,
+		// Carried over explicitly: this upsert replaces the whole document, so
+		// anything not copied here would be silently wiped by an unrelated
+		// settings save.
+		LogShipping: existing.LogShipping,
 		S3: store.S3Config{
 			Enabled:   body.Enabled,
 			Endpoint:  body.Endpoint,

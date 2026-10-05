@@ -79,6 +79,16 @@ func (c *Client) UploadGzipped(ctx context.Context, key string, data []byte, con
 	return buf.Len(), nil
 }
 
+// UploadRaw stores bytes that are ALREADY encoded, declaring that encoding so
+// clients decompress them transparently.
+//
+// Agents gzip their log batches before sending them. Inflating those here only
+// to compress them again would spend CPU on every upload in the fleet to
+// produce the same object, so the bytes are passed through untouched.
+func (c *Client) UploadRaw(ctx context.Context, key string, data []byte, contentType, contentEncoding string) error {
+	return c.upload(ctx, key, data, contentType, contentEncoding)
+}
+
 func (c *Client) upload(ctx context.Context, key string, data []byte, contentType, contentEncoding string) error {
 	if contentType == "" {
 		contentType = "application/octet-stream"

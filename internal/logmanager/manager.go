@@ -54,97 +54,64 @@ func (m *Manager) RunArchival(ctx context.Context, trigger string) error {
 	var (
 		logsArchived     int64
 		sessionsArchived int64
-		logsDeleted      int64
 		bytesArchived    int64
-		archiveKey       string
+		archiveKeys      []string
 		runErr           string
 	)
 
 	// ── Determine archiver ────────────────────────────────────────────────────
+	//
+	// A nil archiver means "delete without archiving", which is the documented
+	// behaviour when no destination is configured: logs still stop
+	// accumulating past the retention period.
 	var arch Archiver
 	if cfg.ArchiveEnabled && cfg.StorageType != "" && len(cfg.StorageCredsEnc) > 0 {
 		arch, err = NewArchiver(cfg.StorageType, cfg.StorageCredsEnc)
 		if err != nil {
 			runErr = err.Error()
-			m.finishRun(run.ID, "failed", runErr, 0, 0, 0, 0)
+			m.finishRun(run.ID, "failed", runErr, 0, 0, 0, 0, nil)
 			return fmt.Errorf("build archiver: %w", err)
 		}
 	}
 
-	// ── Batch logs ────────────────────────────────────────────────────────────
-	prefix := ""
+	// ── Archive each batch, then delete it ────────────────────────────────────
+	var archiveBatch beforeDelete
 	if arch != nil {
-		archiveKey = BuildArchiveKey(prefix, time.Now())
-	}
-
-	for {
-		logs, err := m.store.GetLogsOlderThan(cutoff, batchSize)
-		if err != nil {
-			runErr = err.Error()
-			break
-		}
-		if len(logs) == 0 {
-			break
-		}
-
-		sessions, _ := m.store.GetSessionsOlderThan(cutoff, batchSize)
-		auditLogs, _ := m.store.GetAuditLogsOlderThan(cutoff, batchSize)
-
-		if arch != nil {
-			data, err := MarshalArchive(logs, sessions, auditLogs)
+		runID := run.ID.Hex()
+		seq := 0
+		archiveBatch = func(ctx context.Context, batch expiredBatch) error {
+			data, err := MarshalArchive(batch.logs, batch.sessions, batch.auditLogs)
 			if err != nil {
-				m.logger.Warn("marshal archive batch failed", zap.Error(err))
-			} else {
-				key := archiveKey
-				if logsArchived > 0 {
-					key = BuildArchiveKey(prefix, time.Now())
-				}
-				if err := arch.Upload(ctx, key, data); err != nil {
-					m.logger.Warn("upload batch failed", zap.Error(err))
-					runErr = err.Error()
-					break
-				}
-				bytesArchived += int64(len(data))
-				logsArchived += int64(len(logs))
-				sessionsArchived += int64(len(sessions))
+				// Returning stops the sweep with this batch still in the
+				// database. The previous version logged and carried on into
+				// the delete, which threw the records away unarchived.
+				return fmt.Errorf("encode archive batch: %w", err)
 			}
-		}
 
-		// Delete from DB regardless of whether archival succeeded
-		logIDs := make([]primitive.ObjectID, len(logs))
-		for i, l := range logs {
-			logIDs[i] = l.ID
-		}
-		deleted, err := m.store.DeleteLogsByIDs(logIDs)
-		if err != nil {
-			m.logger.Warn("delete logs batch failed", zap.Error(err))
-		}
-		logsDeleted += deleted
+			key := BuildArchiveKey(prefixFor(cfg), time.Now(), runID, seq)
+			if err := arch.Upload(ctx, key, data); err != nil {
+				return fmt.Errorf("upload archive batch: %w", err)
+			}
 
-		if len(sessions) > 0 {
-			sessIDs := make([]primitive.ObjectID, len(sessions))
-			for i, s := range sessions {
-				sessIDs[i] = s.ID
-			}
-			if _, derr := m.store.DeleteSessionsByIDs(sessIDs); derr != nil {
-				m.logger.Warn("archive: session cleanup failed", zap.Error(derr))
-			}
-		}
-
-		if len(auditLogs) > 0 {
-			auditIDs := make([]primitive.ObjectID, len(auditLogs))
-			for i, a := range auditLogs {
-				auditIDs[i] = a.ID
-			}
-			if _, derr := m.store.DeleteAuditLogsByIDs(auditIDs); derr != nil {
-				m.logger.Warn("archive: audit log cleanup failed", zap.Error(derr))
-			}
-		}
-
-		if len(logs) < batchSize {
-			break // last batch
+			seq++
+			archiveKeys = append(archiveKeys, key)
+			bytesArchived += int64(len(data))
+			logsArchived += int64(len(batch.logs))
+			sessionsArchived += int64(len(batch.sessions))
+			return nil
 		}
 	}
+
+	counts, sweepErr := sweepExpired(ctx, m.store, cutoff, batchSize, archiveBatch)
+	if sweepErr != nil {
+		runErr = sweepErr.Error()
+	}
+	logsDeleted := counts.LogsDeleted
+
+	m.logger.Info("Log expiry swept",
+		zap.Int64("logs_deleted", counts.LogsDeleted),
+		zap.Int64("sessions_deleted", counts.SessionsDeleted),
+		zap.Int64("audit_logs_deleted", counts.AuditLogsDeleted))
 
 	// ── Update config: last/next archive timestamps ──────────────────────────
 	now := time.Now()
@@ -159,14 +126,17 @@ func (m *Manager) RunArchival(ctx context.Context, trigger string) error {
 
 	status := "success"
 	if runErr != "" {
-		if logsDeleted > 0 {
+		// "partial" means some records did make it out. Counting only machine
+		// logs would report a run that expired thousands of sessions as a
+		// total failure.
+		if counts.total() > 0 {
 			status = "partial"
 		} else {
 			status = "failed"
 		}
 	}
 
-	m.finishRun(run.ID, status, runErr, logsArchived, sessionsArchived, logsDeleted, bytesArchived)
+	m.finishRun(run.ID, status, runErr, logsArchived, sessionsArchived, logsDeleted, bytesArchived, archiveKeys)
 	m.logger.Info("Log archival finished",
 		zap.String("status", status),
 		zap.Int64("logs_archived", logsArchived),
@@ -178,6 +148,11 @@ func (m *Manager) RunArchival(ctx context.Context, trigger string) error {
 	}
 	return nil
 }
+
+// prefixFor returns the storage path prefix for a config. The archivers apply
+// their own per-backend prefix from the credentials, so this stays empty
+// unless a config-level one is introduced.
+func prefixFor(_ *store.LogManagementConfig) string { return "" }
 
 // TestConnection verifies that the external storage configuration is reachable.
 func (m *Manager) TestConnection(ctx context.Context, storageType string, encCreds []byte) error {
@@ -194,7 +169,14 @@ func (m *Manager) RestoreFromRun(ctx context.Context, runID primitive.ObjectID) 
 	if err != nil {
 		return 0, 0, fmt.Errorf("run not found: %w", err)
 	}
-	if run.ArchiveKey == "" {
+	// Older runs recorded a single key; runs that span several batches record
+	// one per object. Both are read so a run from before that change is still
+	// restorable.
+	keys := run.ArchiveKeys
+	if len(keys) == 0 && run.ArchiveKey != "" {
+		keys = []string{run.ArchiveKey}
+	}
+	if len(keys) == 0 {
 		return 0, 0, fmt.Errorf("run has no archive key — nothing to restore")
 	}
 
@@ -211,14 +193,23 @@ func (m *Manager) RestoreFromRun(ctx context.Context, runID primitive.ObjectID) 
 		return 0, 0, fmt.Errorf("build archiver: %w", err)
 	}
 
-	data, err := arch.Download(ctx, run.ArchiveKey)
-	if err != nil {
-		return 0, 0, fmt.Errorf("download archive: %w", err)
-	}
-
-	logs, sessions, auditLogs, err := UnmarshalArchive(data)
-	if err != nil {
-		return 0, 0, fmt.Errorf("parse archive: %w", err)
+	var (
+		logs      []*store.LogEntry
+		sessions  []*store.Session
+		auditLogs []*store.AuditLog
+	)
+	for _, key := range keys {
+		data, err := arch.Download(ctx, key)
+		if err != nil {
+			return 0, 0, fmt.Errorf("download archive %s: %w", key, err)
+		}
+		l, sess, a, err := UnmarshalArchive(data)
+		if err != nil {
+			return 0, 0, fmt.Errorf("parse archive %s: %w", key, err)
+		}
+		logs = append(logs, l...)
+		sessions = append(sessions, sess...)
+		auditLogs = append(auditLogs, a...)
 	}
 
 	var restoredLogs, restoredSessions int
@@ -251,8 +242,8 @@ func (m *Manager) RestoreFromRun(ctx context.Context, runID primitive.ObjectID) 
 	return restoredLogs, restoredSessions, nil
 }
 
-func (m *Manager) finishRun(id primitive.ObjectID, status, errMsg string, logsArchived, sessionsArchived, logsDeleted, bytesArchived int64) {
-	if err := m.store.UpdateArchiveRunFinished(id, status, errMsg, logsArchived, sessionsArchived, logsDeleted, bytesArchived); err != nil {
+func (m *Manager) finishRun(id primitive.ObjectID, status, errMsg string, logsArchived, sessionsArchived, logsDeleted, bytesArchived int64, archiveKeys []string) {
+	if err := m.store.UpdateArchiveRunFinished(id, status, errMsg, logsArchived, sessionsArchived, logsDeleted, bytesArchived, archiveKeys); err != nil {
 		m.logger.Warn("failed to update archive run", zap.Error(err))
 	}
 }

@@ -23,14 +23,27 @@ type ArchiveRecord struct {
 	Payload json.RawMessage `json:"payload"`
 }
 
-// BuildArchiveKey returns the storage key for an archive at time t.
-func BuildArchiveKey(prefix string, t time.Time) string {
+// BuildArchiveKey returns the storage key for batch seq of the run runID.
+//
+// The timestamp alone is not unique enough to key on. It has one-second
+// resolution while a batch takes milliseconds, so a multi-batch run produced
+// the same key repeatedly and each upload silently overwrote the last — the
+// records were still deleted from the database, so everything but the final
+// batch was simply lost. The run id and batch number make each object
+// distinct, and the run id also separates two runs that start in the same
+// second.
+func BuildArchiveKey(prefix string, t time.Time, runID string, seq int) string {
 	if prefix == "" {
 		prefix = "vsay-logs"
 	}
-	return fmt.Sprintf("%s/archive-%s.ndjson.gz",
+	if runID == "" {
+		runID = "run"
+	}
+	return fmt.Sprintf("%s/archive-%s-%s-%03d.ndjson.gz",
 		strings.TrimRight(prefix, "/"),
-		t.UTC().Format("20060102T150405Z"))
+		t.UTC().Format("20060102T150405Z"),
+		runID,
+		seq)
 }
 
 // MarshalArchive encodes logs + sessions + audit logs as gzipped NDJSON.

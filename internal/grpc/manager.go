@@ -272,6 +272,39 @@ func (m *AgentManager) SendUpdateCommand(agentID string, downloadURL string) err
 	}
 }
 
+// LogShipCommandID carries system-log collection settings to an agent. It must
+// match the constant the agent routes on; the drift test in this package reads
+// the agent source to check that it still does.
+const LogShipCommandID = "__vsay_logship__"
+
+// SendLogShipConfig pushes system-log collection settings to a connected agent.
+// settingsJSON is a serialised agent-side LogShippingConfig.
+//
+// The agent writes what it receives to its own config file before applying it,
+// so a machine keeps collecting what it was told to across restarts.
+func (m *AgentManager) SendLogShipConfig(agentID string, settingsJSON string) error {
+	conn := m.GetConnection(agentID)
+	if conn == nil {
+		return fmt.Errorf("agent not connected")
+	}
+
+	msg := &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_Command{
+			Command: &agentv1.CommandRequest{
+				CommandId: LogShipCommandID,
+				Command:   settingsJSON,
+			},
+		},
+	}
+
+	select {
+	case conn.InputChan <- msg:
+		return nil
+	case <-time.After(time.Second):
+		return fmt.Errorf("timeout sending log settings to agent")
+	}
+}
+
 // KickAgent forcibly closes the gRPC connection for a specific agent.
 // Used after machine revocation to immediately cut off access.
 // The agent's reconnect loop will attempt to re-register, which will fail

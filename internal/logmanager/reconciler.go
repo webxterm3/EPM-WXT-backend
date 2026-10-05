@@ -5,9 +5,12 @@ import (
 	"time"
 
 	"github.com/vsay/vsay-agent-backend/internal/store"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.uber.org/zap"
 )
+
+// reconcileBatchSize is smaller than the archival batch size: this path runs
+// hourly on a live database and should not hold it for long.
+const reconcileBatchSize = 500
 
 // Reconciler runs on a schedule and triggers archival/deletion when due.
 type Reconciler struct {
@@ -65,64 +68,28 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 		return
 	}
 
-	// Archiving disabled — only delete expired logs from DB
+	// Archiving disabled, or enabled without a frequency — expired records are
+	// still removed, so "retention" means the same thing either way.
 	cutoff := time.Now().AddDate(0, 0, -cfg.RetentionDays)
-	r.deleteExpiredLogs(ctx, cutoff)
+	r.deleteExpired(ctx, cutoff)
 }
 
-func (r *Reconciler) deleteExpiredLogs(ctx context.Context, cutoff time.Time) {
-	_ = ctx
-	var totalDeleted int64
-
-	for {
-		logs, err := r.store.GetLogsOlderThan(cutoff, 500)
-		if err != nil {
-			r.logger.Warn("deleteExpiredLogs: query failed", zap.Error(err))
-			break
-		}
-		if len(logs) == 0 {
-			break
-		}
-
-		ids := make([]primitive.ObjectID, len(logs))
-		for i, l := range logs {
-			ids[i] = l.ID
-		}
-		deleted, err := r.store.DeleteLogsByIDs(ids)
-		if err != nil {
-			r.logger.Warn("deleteExpiredLogs: delete failed", zap.Error(err))
-			break
-		}
-		totalDeleted += deleted
-
-		sessions, _ := r.store.GetSessionsOlderThan(cutoff, 500)
-		if len(sessions) > 0 {
-			sessIDs := make([]primitive.ObjectID, len(sessions))
-			for i, s := range sessions {
-				sessIDs[i] = s.ID
-			}
-			if _, derr := r.store.DeleteSessionsByIDs(sessIDs); derr != nil {
-				r.logger.Warn("deleteExpiredLogs: session cleanup failed", zap.Error(derr))
-			}
-		}
-
-		auditLogs, _ := r.store.GetAuditLogsOlderThan(cutoff, 500)
-		if len(auditLogs) > 0 {
-			auditIDs := make([]primitive.ObjectID, len(auditLogs))
-			for i, a := range auditLogs {
-				auditIDs[i] = a.ID
-			}
-			if _, derr := r.store.DeleteAuditLogsByIDs(auditIDs); derr != nil {
-				r.logger.Warn("deleteExpiredLogs: audit log cleanup failed", zap.Error(derr))
-			}
-		}
-
-		if len(logs) < 500 {
-			break
-		}
+// deleteExpired removes everything past the cutoff without archiving it.
+//
+// It shares sweepExpired with the archival path rather than repeating the
+// loop. The two copies had drifted into the same bug — both stopped as soon as
+// the machine-log page came back short, so sessions and audit logs outlived
+// their retention period indefinitely.
+func (r *Reconciler) deleteExpired(ctx context.Context, cutoff time.Time) {
+	counts, err := sweepExpired(ctx, r.store, cutoff, reconcileBatchSize, nil)
+	if err != nil {
+		r.logger.Warn("Expired log cleanup did not finish", zap.Error(err))
 	}
 
-	if totalDeleted > 0 {
-		r.logger.Info("Expired logs deleted", zap.Int64("count", totalDeleted))
+	if counts.total() > 0 {
+		r.logger.Info("Expired records deleted",
+			zap.Int64("logs", counts.LogsDeleted),
+			zap.Int64("sessions", counts.SessionsDeleted),
+			zap.Int64("audit_logs", counts.AuditLogsDeleted))
 	}
 }

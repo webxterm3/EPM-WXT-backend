@@ -222,15 +222,59 @@ type ArchiveRun struct {
 	LogsDeleted      int64              `bson:"logs_deleted" json:"logs_deleted"`
 	BytesArchived    int64              `bson:"bytes_archived" json:"bytes_archived"`
 	ArchiveKey       string             `bson:"archive_key" json:"archive_key"`
-	ErrorMsg         string             `bson:"error_msg,omitempty" json:"error_msg,omitempty"`
+	// ArchiveKeys holds every object a run wrote. A run that spans several
+	// batches writes several objects, and recording only one of them made all
+	// but that one unrestorable.
+	ArchiveKeys []string `bson:"archive_keys,omitempty" json:"archive_keys,omitempty"`
+	ErrorMsg    string   `bson:"error_msg,omitempty" json:"error_msg,omitempty"`
 }
 
 // TenantConfig holds per-tenant settings stored in agent-backend
 type TenantConfig struct {
-	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	TenantID  string             `bson:"tenant_id" json:"tenant_id"`
-	S3        S3Config           `bson:"s3" json:"s3"`
-	UpdatedAt time.Time          `bson:"updated_at" json:"updated_at"`
+	ID          primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	TenantID    string             `bson:"tenant_id" json:"tenant_id"`
+	S3          S3Config           `bson:"s3" json:"s3"`
+	LogShipping LogShippingConfig  `bson:"log_shipping" json:"log_shipping"`
+	UpdatedAt   time.Time          `bson:"updated_at" json:"updated_at"`
+}
+
+// AgentPayload renders the policy in the exact shape the agent unmarshals.
+//
+// It lives on the type so every sender uses one spelling of these keys. They
+// are the agent's own config-file keys, and getting one wrong does not fail —
+// encoding/json simply leaves that field at its zero value, so a typo here
+// would quietly turn a setting off on the whole fleet.
+func (c LogShippingConfig) AgentPayload() map[string]any {
+	return map[string]any{
+		"enabled":            c.Enabled,
+		"system_logs":        c.SystemLogs,
+		"websites":           c.Websites,
+		"interval_seconds":   c.IntervalSeconds,
+		"daily_budget_mb":    c.DailyBudgetMB,
+		"backfill_hours":     c.BackfillHours,
+		"include_info_debug": c.IncludeInfoDebug,
+		"keep_raw":           c.KeepRaw,
+		"windows_channels":   c.WindowsChannels,
+	}
+}
+
+// LogShippingConfig is the tenant-wide policy for collecting each machine's own
+// system logs. It mirrors the agent-side struct field for field, because it is
+// serialised straight to the agent over the gRPC command channel.
+//
+// It is stored per tenant rather than per machine so a fleet is configured
+// once; the archive destination is the tenant's S3 config, and collection does
+// nothing useful without one.
+type LogShippingConfig struct {
+	Enabled          bool     `bson:"enabled" json:"enabled"`
+	SystemLogs       bool     `bson:"system_logs" json:"system_logs"`
+	Websites         bool     `bson:"websites" json:"websites"`
+	IntervalSeconds  int      `bson:"interval_seconds" json:"interval_seconds"`
+	DailyBudgetMB    int      `bson:"daily_budget_mb" json:"daily_budget_mb"`
+	BackfillHours    int      `bson:"backfill_hours" json:"backfill_hours"`
+	IncludeInfoDebug bool     `bson:"include_info_debug" json:"include_info_debug"`
+	KeepRaw          bool     `bson:"keep_raw" json:"keep_raw"`
+	WindowsChannels  []string `bson:"windows_channels,omitempty" json:"windows_channels,omitempty"`
 }
 
 // SessionRecording tracks a terminal session recording stored in S3
@@ -379,7 +423,7 @@ type Store interface {
 	CreateArchiveRun(run *ArchiveRun) error
 	GetArchiveRuns(limit int) ([]*ArchiveRun, error)
 	GetArchiveRunByID(id primitive.ObjectID) (*ArchiveRun, error)
-	UpdateArchiveRunFinished(id primitive.ObjectID, status, errMsg string, logsArchived, sessionsArchived, logsDeleted, bytesArchived int64) error
+	UpdateArchiveRunFinished(id primitive.ObjectID, status, errMsg string, logsArchived, sessionsArchived, logsDeleted, bytesArchived int64, archiveKeys []string) error
 
 	// Access requests
 	CreateAccessRequest(req *AccessRequest) error

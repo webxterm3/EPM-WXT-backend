@@ -1,4 +1,4 @@
-# Vsay Agent Backend
+# EPM Wxt Backend
 
 Backend server for Vsay Agent, providing gRPC interface for agents and HTTP API for the frontend.
 

@@ -239,6 +239,12 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"mtls_enabled": mtls})
 	})
 
+	// Agent system-log intake — called by agents shipping the MACHINE's own
+	// logs (Windows Event Log / macOS unified log / website activity).
+	// Auth: Bearer <registration_token>, the same credential as sign-cert.
+	logIngest := api.NewLogIngestHandler(st, logger)
+	r.POST("/agent/logs", logIngest.Ingest)
+
 	// Agent cert signing — called by agents during configure/renewal
 	// Auth: Bearer <registration_token>
 	// Header X-Cert-Fingerprint: <sha256-of-current-cert>  (optional on first sign, required on renewal)
@@ -427,6 +433,8 @@ func main() {
 		// S3 / tenant configuration
 		auth.GET("/config/s3", h.GetS3Config)
 		auth.POST("/config/s3", h.SaveS3Config)
+		auth.GET("/config/log-shipping", h.GetLogShippingConfig)
+		auth.POST("/config/log-shipping", h.SaveLogShippingConfig)
 
 		// Session recordings
 		auth.GET("/machines/:agent_id/recordings", h.GetMachineRecordings)

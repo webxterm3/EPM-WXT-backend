@@ -1489,17 +1489,25 @@ func (m *MongoDB) GetArchiveRunByID(id primitive.ObjectID) (*ArchiveRun, error) 
 	return &run, nil
 }
 
-func (m *MongoDB) UpdateArchiveRunFinished(id primitive.ObjectID, status, errMsg string, logsArchived, sessionsArchived, logsDeleted, bytesArchived int64) error {
+func (m *MongoDB) UpdateArchiveRunFinished(id primitive.ObjectID, status, errMsg string, logsArchived, sessionsArchived, logsDeleted, bytesArchived int64, archiveKeys []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	now := time.Now()
-	_, err := m.ArchiveRuns.UpdateOne(ctx, bson.M{"_id": id}, bson.M{
-		"$set": bson.M{
-			"finished_at": &now, "status": status, "error_msg": errMsg,
-			"logs_archived": logsArchived, "sessions_archived": sessionsArchived,
-			"logs_deleted": logsDeleted, "bytes_archived": bytesArchived,
-		},
-	})
+
+	fields := bson.M{
+		"finished_at": &now, "status": status, "error_msg": errMsg,
+		"logs_archived": logsArchived, "sessions_archived": sessionsArchived,
+		"logs_deleted": logsDeleted, "bytes_archived": bytesArchived,
+	}
+	// Written here rather than when the run starts, because the number of
+	// objects is not known until the last batch is uploaded. Without this the
+	// run records no keys at all and Restore has nothing to fetch.
+	if len(archiveKeys) > 0 {
+		fields["archive_keys"] = archiveKeys
+		fields["archive_key"] = archiveKeys[0] // kept for pre-existing readers
+	}
+
+	_, err := m.ArchiveRuns.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": fields})
 	return err
 }
 
