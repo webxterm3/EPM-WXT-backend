@@ -7,19 +7,34 @@
 # ============================================================================
 
 # ---- Build stage: compile the Go backend (+ grab ca-certs & tini for the final image)
-FROM golang:1.25-alpine AS builder
+#
+# Pinned to BUILDPLATFORM so the compiler always runs natively and cross-compiles
+# to the target. Without this, buildx runs this whole stage under QEMU for the
+# non-native architecture, and a Go build under emulation takes minutes rather
+# than seconds. Safe because CGO is off below — nothing here links to C.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /app
-# ca-certificates + tini are copied into the guacd-based final image, which is Alpine
-# but minimal (no package manager use at that stage).
-RUN apk add --no-cache git ca-certificates tini
+# ca-certificates is copied into the final image. It is a PEM text file, so it
+# is architecture-independent and safe to carry across stages.
+#
+# tini is deliberately NOT installed here. This stage runs on the BUILD
+# platform so the Go compiler is native, which means anything apk installs here
+# is a BUILD-arch binary. Copying such a binary into a cross-built image
+# produces "exec format error" at startup — and since tini is PID 1, the
+# container never starts at all. It is installed in the final stage instead.
+RUN apk add --no-cache git ca-certificates
 
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
 RUN mkdir -p /app/certs /app/agent-binaries
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o vsay-backend ./cmd/server
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -ldflags="-w -s" -o vsay-backend ./cmd/server
 
 # ---- Runtime stage: guacd image + our backend ----
 # guacamole/guacd:1.6.0 is multi-arch (amd64 + arm64), so buildx can produce both.
@@ -31,14 +46,16 @@ USER root
 # Pick up patched versions of whatever the upstream guacd image's own Alpine
 # packages have fixes available for (e.g. glib CVEs), regardless of how
 # stale that base image tag is at build time.
-RUN apk upgrade --no-cache
+# tini is installed HERE rather than copied from the builder: this stage runs
+# on the TARGET platform, so apk fetches a binary matching the image's own
+# architecture. See the note in the build stage for what goes wrong otherwise.
+RUN apk upgrade --no-cache && apk add --no-cache tini
 
 WORKDIR /app
 
-# CA bundle (for the backend's outbound TLS: MongoDB Atlas, Cloudinary, S3) + tini
-# (proper PID 1) copied from the Alpine builder — no package manager needed here.
+# CA bundle for the backend's outbound TLS (MongoDB Atlas, Cloudinary, S3).
+# Architecture-independent, so copying it from the builder is safe.
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=builder /sbin/tini /sbin/tini
 
 # Backend binary + assets from the build stage.
 COPY --from=builder /app/vsay-backend /app/vsay-backend

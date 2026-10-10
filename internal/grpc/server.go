@@ -3,6 +3,7 @@ package grpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -298,6 +299,16 @@ func (s *AgentServer) Register(ctx context.Context, req *agentv1.RegisterRequest
 		zap.String("agent_id", agentID),
 		zap.String("name", pendingMachine.Name))
 
+	// Recorded so "when did this machine join, and running what" is answerable
+	// from the audit trail rather than only from a log file that rotates.
+	pendingMachine.AgentID = agentID
+	s.recordAgentEvent(pendingMachine, store.AuditAgentRegistered, map[string]any{
+		"os":         req.OsInfo,
+		"ip_address": req.IpAddress,
+		"version":    req.Metadata["version"],
+		"hostname":   req.Hostname,
+	})
+
 	return &agentv1.RegisterResponse{
 		AgentId:  agentID,
 		Approved: true,
@@ -403,7 +414,18 @@ func (s *AgentServer) Stream(stream agentv1.AgentService_StreamServer) error {
 				return
 			}
 			if err != nil {
-				s.logger.Error("Stream recv error", zap.Error(err))
+				// A cancelled context is how a stream ends when WE close it —
+				// the agent was kicked, revoked, or the server is shutting
+				// down. Logging that at Error, with a stack trace, buries real
+				// failures under noise from routine operations: deleting one
+				// machine produced an ERROR with a stack trace in production.
+				if isExpectedStreamEnd(err) {
+					s.logger.Info("Agent stream closed",
+						zap.String("agent_id", agentID), zap.String("reason", err.Error()))
+					return
+				}
+				s.logger.Error("Stream recv error",
+					zap.String("agent_id", agentID), zap.Error(err))
 				return
 			}
 
@@ -473,7 +495,7 @@ func (s *AgentServer) Stream(stream agentv1.AgentService_StreamServer) error {
 				// Access events and agent-stats have their own handlers — don't dump the
 				// raw status JSON for them (agent stats especially would flood the log).
 				if statusVal != "__access_event__" && statusVal != "__agent_stats__" &&
-					statusVal != "__access_snapshot__" {
+					statusVal != "__access_snapshot__" && statusVal != AppInventoryDiscriminator {
 					s.logger.Info("Agent status update",
 						zap.String("agent_id", agentID),
 						zap.String("status", statusVal),
@@ -497,6 +519,11 @@ func (s *AgentServer) Stream(stream agentv1.AgentService_StreamServer) error {
 				// Agent process resource usage (for Agent Monitoring).
 				if statusVal == "__agent_stats__" {
 					go s.handleAgentStats(agentID, payload.Status.Message)
+				}
+				// Installed-software snapshot, in chunks. Application control
+				// policy is written against this.
+				if statusVal == AppInventoryDiscriminator {
+					go s.handleAppInventory(agentID, payload.Status.Message)
 				}
 			case *agentv1.AgentMessage_TerminalOutput:
 				// RDP tunnel sessions ("rdp_") carry port-forward data for the
@@ -575,8 +602,31 @@ func (s *AgentServer) sendLogShipPolicy(conn *AgentConnection, tenantID, agentID
 		s.logger.Debug("Log shipping: policy sent",
 			zap.String("agent_id", agentID),
 			zap.Bool("enabled", cfg.LogShipping.Enabled))
+		if machine, err := s.store.GetMachineByAgentID(agentID); err == nil {
+			s.recordAgentEvent(machine, store.AuditPolicySynced, map[string]any{
+				"policy":  "log_shipping",
+				"enabled": cfg.LogShipping.Enabled,
+			})
+		}
 	default:
 		s.logger.Warn("Log shipping: InputChan full, policy dropped",
 			zap.String("agent_id", agentID))
 	}
+}
+
+// isExpectedStreamEnd reports whether a stream error is a normal disconnect
+// rather than a fault.
+//
+// Cancellation is ours: KickAgent cancels the connection's context when a
+// machine is revoked or deleted. Unavailable is the agent's: it was stopped,
+// restarted, or lost its network. Neither is a problem anyone needs woken for.
+func isExpectedStreamEnd(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
+		return true
+	}
+	switch status.Code(err) {
+	case codes.Canceled, codes.Unavailable:
+		return true
+	}
+	return false
 }

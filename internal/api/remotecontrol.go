@@ -63,9 +63,17 @@ type rcSession struct {
 	Reason    string `json:"reason,omitempty"`
 	ViewOnly  bool   `json:"view_only"`
 	// IdleTimeoutMinutes is what the machine is enforcing for this session.
-	IdleTimeoutMinutes int       `json:"idle_timeout_minutes,omitempty"`
-	StartedAt          time.Time `json:"started_at,omitempty"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	IdleTimeoutMinutes int `json:"idle_timeout_minutes,omitempty"`
+
+	// MaxSessionMinutes is an ABSOLUTE cap from the remote-access policy,
+	// measured from StartedAt. It is distinct from the idle timeout, which a
+	// busy session never reaches: somebody moving the mouse continuously would
+	// otherwise stay connected indefinitely under a policy that says thirty
+	// minutes. Zero means no cap.
+	MaxSessionMinutes int `json:"max_session_minutes,omitempty"`
+
+	StartedAt time.Time `json:"started_at,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // RemoteControlManager tracks one session per agent.
@@ -176,14 +184,71 @@ func (m *RemoteControlManager) reap() {
 	defer t.Stop()
 	for range t.C {
 		cutoff := time.Now().Add(-rcSessionTTL)
+
+		var expired []string
 		m.mu.Lock()
 		for id, s := range m.sessions {
 			if s.State != rcStateActive && s.UpdatedAt.Before(cutoff) {
 				delete(m.sessions, id)
+				continue
+			}
+			if m.overRunning(s) {
+				expired = append(expired, id)
 			}
 		}
 		m.mu.Unlock()
+
+		// Sent outside the lock: the send goes over the agent stream and
+		// holding the manager's mutex across it would stall every other
+		// session on this server.
+		for _, agentID := range expired {
+			m.endOverrunningSession(agentID)
+		}
 	}
+}
+
+// overRunning reports whether an active session has outlived its policy cap.
+// Called with the lock held.
+func (m *RemoteControlManager) overRunning(s *rcSession) bool {
+	if s.State != rcStateActive || s.MaxSessionMinutes <= 0 || s.StartedAt.IsZero() {
+		return false
+	}
+	return time.Since(s.StartedAt) >= time.Duration(s.MaxSessionMinutes)*time.Minute
+}
+
+// endOverrunningSession closes a session that reached its policy limit.
+//
+// The machine is told to stop first and the local state is cleared after, so a
+// failure to reach the agent still leaves the portal showing the session as
+// over — the opposite order could leave somebody's screen shared with nothing
+// in the portal saying so.
+func (m *RemoteControlManager) endOverrunningSession(agentID string) {
+	m.mu.Lock()
+	s := m.sessions[agentID]
+	var limit int
+	if s != nil {
+		limit = s.MaxSessionMinutes
+	}
+	m.mu.Unlock()
+
+	if err := m.send(agentID, map[string]any{"type": rcMsgStop}); err != nil {
+		m.logger.Warn("Could not stop a session that reached its time limit",
+			zap.String("agent_id", agentID), zap.Error(err))
+	}
+
+	m.mu.Lock()
+	if s := m.sessions[agentID]; s != nil {
+		s.State = rcStateIdle
+		s.Port = 0
+		s.Password = ""
+		s.Error = "the session reached the time limit set by your remote access policy"
+		s.UpdatedAt = time.Now()
+	}
+	m.mu.Unlock()
+
+	m.logger.Info("Remote session ended at its policy time limit",
+		zap.String("agent_id", agentID),
+		zap.Int("max_session_minutes", limit))
 }
 
 func (m *RemoteControlManager) send(agentID string, payload map[string]any) error {
@@ -255,6 +320,20 @@ func (h *Handler) StartRemoteControl(c *gin.Context) {
 		adminName = fmt.Sprintf("%s (%s)", adminName, email)
 	}
 
+	// Policy runs after the ownership check above, never instead of it: it can
+	// only narrow what this person may already do.
+	decision, ok := h.enforceRemoteAccessPolicy(c, machine, store.AccessAttended, body.Reason)
+	if !ok {
+		return
+	}
+	// Conditions the policy attached. Consent is forced on when the policy
+	// says so; a policy can tighten it but the product's own default already
+	// requires it for attended sessions.
+	if decision.MaxSessionMinutes > 0 &&
+		(body.IdleTimeoutMinutes == 0 || decision.MaxSessionMinutes < body.IdleTimeoutMinutes) {
+		body.IdleTimeoutMinutes = decision.MaxSessionMinutes
+	}
+
 	m := h.remoteControl
 	m.mu.Lock()
 	if s := m.sessions[agentID]; s != nil && (s.State == rcStateActive || s.State == rcStateAwaitingConsent) {
@@ -273,6 +352,7 @@ func (h *Handler) StartRemoteControl(c *gin.Context) {
 		Reason:             body.Reason,
 		ViewOnly:           body.ViewOnly,
 		IdleTimeoutMinutes: body.IdleTimeoutMinutes,
+		MaxSessionMinutes:  decision.MaxSessionMinutes,
 		UpdatedAt:          time.Now(),
 	}
 	m.mu.Unlock()
@@ -300,22 +380,19 @@ func (h *Handler) StartRemoteControl(c *gin.Context) {
 		return
 	}
 
-	_ = h.store.CreateAuditLog(&store.AuditLog{
-		ActorID:    c.GetHeader("X-User-ID"),
-		ActorName:  c.GetHeader("X-Username"),
-		ActorRole:  c.GetHeader("X-User-Role"),
-		Action:     "remote_control.request",
-		Resource:   "machine",
-		ResourceID: machine.ID.Hex(),
+	// Recorded through the shared helper so the entry carries the tenant and
+	// the machine's identity — the previous call set neither, which left the
+	// entry unfindable by any tenant-scoped query.
+	h.record(c, auditEntry{
+		Action: store.AuditRemoteStarted, Resource: "machine",
+		ResourceID: machine.AgentID, Machine: machine,
 		Details: map[string]any{
-			"machine":              machine.Name,
 			"reason":               body.Reason,
 			"view_only":            body.ViewOnly,
 			"idle_timeout_minutes": body.IdleTimeoutMinutes,
+			"max_session_minutes":  decision.MaxSessionMinutes,
+			"policy":               decision.PolicyName,
 		},
-		IPAddress: c.ClientIP(),
-		Status:    "success",
-		Timestamp: time.Now(),
 	})
 
 	h.logger.Info("Remote control requested",
@@ -398,17 +475,9 @@ func (h *Handler) StopRemoteControl(c *gin.Context) {
 	}
 	m.mu.Unlock()
 
-	_ = h.store.CreateAuditLog(&store.AuditLog{
-		ActorID:    c.GetHeader("X-User-ID"),
-		ActorName:  c.GetHeader("X-Username"),
-		ActorRole:  c.GetHeader("X-User-Role"),
-		Action:     "remote_control.stop",
-		Resource:   "machine",
-		ResourceID: machine.ID.Hex(),
-		Details:    map[string]any{"machine": machine.Name},
-		IPAddress:  c.ClientIP(),
-		Status:     "success",
-		Timestamp:  time.Now(),
+	h.record(c, auditEntry{
+		Action: store.AuditRemoteStopped, Resource: "machine",
+		ResourceID: machine.AgentID, Machine: machine,
 	})
 
 	c.JSON(http.StatusOK, gin.H{"state": rcStateIdle})

@@ -706,6 +706,23 @@ func (h *Handler) RDPWebSocket(c *gin.Context) {
 		return
 	}
 
+	// This endpoint previously checked only that the agent was online, so any
+	// authenticated user who knew an agent id could open a desktop session on
+	// any machine, in any tenant. The ownership check runs first, as it does
+	// on every other per-machine route, and the policy gate narrows it further.
+	machine, err := h.store.GetMachineByAgentID(agentID)
+	if err != nil || machine == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "machine not found"})
+		return
+	}
+	if !h.canAccessMachine(c, machine) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have access to this machine"})
+		return
+	}
+	if _, ok := h.enforceRemoteAccessPolicy(c, machine, store.AccessUnattended, c.Query("reason")); !ok {
+		return
+	}
+
 	username := c.Query("username")
 	password := c.Query("password")
 	domain := c.Query("domain")
@@ -717,10 +734,8 @@ func (h *Handler) RDPWebSocket(c *gin.Context) {
 	protocol := c.Query("protocol")
 	if protocol == "" {
 		protocol = "rdp"
-		if machine, err := h.store.GetMachineByAgentID(agentID); err == nil && machine != nil {
-			if machine.Metadata != nil && machine.Metadata["remote_desktop"] == "vnc" {
-				protocol = "vnc"
-			}
+		if machine.Metadata != nil && machine.Metadata["remote_desktop"] == "vnc" {
+			protocol = "vnc"
 		}
 	}
 

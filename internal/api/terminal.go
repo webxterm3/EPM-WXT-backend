@@ -258,6 +258,11 @@ func (h *Handler) TerminalWebSocket(c *gin.Context) {
 		return
 	}
 
+	// Policy runs after the access check above, never instead of it.
+	if _, ok := h.enforceRemoteAccessPolicy(c, machine, store.AccessTerminal, ""); !ok {
+		return
+	}
+
 	// Upgrade to WebSocket
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {

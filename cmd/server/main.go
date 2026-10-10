@@ -431,6 +431,35 @@ func main() {
 		auth.POST("/community/upload", h.UploadImage)
 
 		// S3 / tenant configuration
+		// Installed-application inventory. Read-only in Phase A: the agent
+		// reports, the portal displays, nothing is enforced on any endpoint.
+		auth.GET("/machines/:agent_id/applications", h.GetMachineApplications)
+		auth.GET("/applications/catalog", h.GetAppCatalog)
+		auth.GET("/applications/machines", h.GetMachinesWithApp)
+
+		// Application-control policies. Authored and projected in Phase A;
+		// enforcementEnabled in internal/api/policies.go is false, so nothing
+		// reaches any endpoint.
+		auth.GET("/app-policies", h.ListAppPolicies)
+		auth.POST("/app-policies", h.CreateAppPolicy)
+		auth.POST("/app-policies/simulate", h.SimulateAppPolicy)
+		auth.GET("/app-policies/:id", h.GetAppPolicy)
+		auth.PUT("/app-policies/:id", h.UpdateAppPolicy)
+		auth.DELETE("/app-policies/:id", h.DeleteAppPolicy)
+
+		// Remote-access policies: who may connect to which machines, by what
+		// means, when, and under what conditions.
+		auth.GET("/remote-access-policies", h.ListRemoteAccessPolicies)
+		auth.POST("/remote-access-policies", h.CreateRemoteAccessPolicy)
+		auth.GET("/remote-access-policies/:id", h.GetRemoteAccessPolicy)
+		auth.PUT("/remote-access-policies/:id", h.UpdateRemoteAccessPolicy)
+		auth.DELETE("/remote-access-policies/:id", h.DeleteRemoteAccessPolicy)
+
+		// Endpoint audit events, export and the compliance report.
+		auth.GET("/audit-events", h.ListAuditEvents)
+		auth.GET("/audit-events/export", h.ExportAuditEvents)
+		auth.GET("/compliance-report", h.ComplianceReport)
+
 		auth.GET("/config/s3", h.GetS3Config)
 		auth.POST("/config/s3", h.SaveS3Config)
 		auth.GET("/config/log-shipping", h.GetLogShippingConfig)

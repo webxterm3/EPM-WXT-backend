@@ -1,6 +1,7 @@
 package api
 
 import (
+	"github.com/vsay/vsay-agent-backend/internal/store"
 	"net/http"
 	"os"
 	"strings"
@@ -156,6 +157,16 @@ func (h *Handler) UpdateAgent(c *gin.Context) {
 		zap.String("os", osName),
 		zap.String("arch", arch),
 		zap.String("url", downloadURL))
+
+	// "Who upgraded this machine's agent, and when" — a question that comes up
+	// the moment an upgrade coincides with something breaking.
+	h.record(c, auditEntry{
+		Action: store.AuditAgentUpdated, Resource: "machine",
+		ResourceID: agentID, Machine: machine,
+		Details: map[string]any{
+			"target_os": osName, "target_arch": arch, "package": downloadURL,
+		},
+	})
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":      "Update command sent. The agent will download, update, and restart.",

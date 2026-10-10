@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -85,6 +86,365 @@ type AccessEventKey struct {
 	Line   string
 }
 
+// InstalledApp is one application on one machine, as last reported by its
+// agent.
+//
+// Rows are marked gone rather than deleted, because "what was uninstalled last
+// week" is a question this product exists to answer and a delete destroys it.
+type InstalledApp struct {
+	ID          primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	MachineID   primitive.ObjectID `bson:"machine_id" json:"machine_id"`
+	AgentID     string             `bson:"agent_id" json:"agent_id"`
+	MachineName string             `bson:"machine_name" json:"machine_name"`
+	TenantID    string             `bson:"tenant_id" json:"tenant_id"`
+
+	// AppKey is the application's identity on this machine, assigned by the
+	// agent. It never contains the version: if it did, every Chrome
+	// auto-update would look like an uninstall followed by an install, and
+	// FirstSeen would reset every week.
+	AppKey string `bson:"app_key" json:"app_key"`
+
+	Name      string `bson:"name" json:"name"`
+	NameLower string `bson:"name_lower" json:"-"`
+	Version   string `bson:"version,omitempty" json:"version,omitempty"`
+
+	Publisher      string `bson:"publisher,omitempty" json:"publisher,omitempty"`
+	PublisherLower string `bson:"publisher_lower,omitempty" json:"-"`
+
+	InstallPath string `bson:"install_path,omitempty" json:"install_path,omitempty"`
+	ExePath     string `bson:"exe_path,omitempty" json:"exe_path,omitempty"`
+	BundleID    string `bson:"bundle_id,omitempty" json:"bundle_id,omitempty"`
+
+	Source string `bson:"source" json:"source"`
+	Scope  string `bson:"scope,omitempty" json:"scope,omitempty"`
+	OSUser string `bson:"os_user,omitempty" json:"os_user,omitempty"`
+	Arch   string `bson:"arch,omitempty" json:"arch,omitempty"`
+
+	InstalledAt *time.Time `bson:"installed_at,omitempty" json:"installed_at,omitempty"`
+
+	// Hash fields are owned by the on-demand hash path, never by a scan.
+	// A scan upsert that touched them would wipe a computed hash every time
+	// the machine reported.
+	SHA256    string     `bson:"sha256,omitempty" json:"sha256,omitempty"`
+	HashState string     `bson:"hash_state,omitempty" json:"hash_state,omitempty"`
+	HashedAt  *time.Time `bson:"hashed_at,omitempty" json:"hashed_at,omitempty"`
+
+	FirstSeen time.Time  `bson:"first_seen" json:"first_seen"`
+	LastSeen  time.Time  `bson:"last_seen" json:"last_seen"`
+	Present   bool       `bson:"present" json:"present"`
+	RemovedAt *time.Time `bson:"removed_at,omitempty" json:"removed_at,omitempty"`
+
+	// ScanID is the snapshot that last touched this row. The removal sweep
+	// works by marking everything the latest scan did NOT touch, which is far
+	// cheaper than asking the database about three hundred keys individually.
+	ScanID    string    `bson:"scan_id" json:"-"`
+	UpdatedAt time.Time `bson:"updated_at" json:"updated_at"`
+}
+
+// InventoryScan records one reported snapshot.
+//
+// Without it, "this machine has no software" and "this machine has never
+// reported" look identical, which is the most common support question any
+// inventory product gets.
+type InventoryScan struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	MachineID primitive.ObjectID `bson:"machine_id" json:"machine_id"`
+	AgentID   string             `bson:"agent_id" json:"agent_id"`
+	TenantID  string             `bson:"tenant_id" json:"tenant_id"`
+	ScanID    string             `bson:"scan_id" json:"scan_id"`
+
+	OS           string `bson:"os,omitempty" json:"os,omitempty"`
+	AgentVersion string `bson:"agent_version,omitempty" json:"agent_version,omitempty"`
+
+	Reported int   `bson:"reported" json:"reported"`
+	Added    int64 `bson:"added" json:"added"`
+	Updated  int64 `bson:"updated" json:"updated"`
+	Removed  int64 `bson:"removed" json:"removed"`
+	Chunks   int   `bson:"chunks" json:"chunks"`
+
+	// CollectError is whatever the agent's collector reported. A scan carrying
+	// one is never allowed to mark software as removed.
+	CollectError string `bson:"collect_error,omitempty" json:"collect_error,omitempty"`
+
+	// Complete is false until the final chunk arrives. An incomplete scan is a
+	// partial picture, not a statement that the rest is gone.
+	Complete bool `bson:"complete" json:"complete"`
+
+	StartedAt  time.Time  `bson:"started_at" json:"started_at"`
+	FinishedAt *time.Time `bson:"finished_at,omitempty" json:"finished_at,omitempty"`
+}
+
+// InventoryQuery filters a per-machine application listing.
+//
+// A struct rather than the codebase's usual positional (limit, skip) pair,
+// because this needs search and include-removed as well and five positional
+// arguments is how call sites start passing them in the wrong order.
+type InventoryQuery struct {
+	Search         string
+	Source         string
+	IncludeRemoved bool
+	Limit, Skip    int
+}
+
+// CatalogEntry is one distinct application across the fleet.
+type CatalogEntry struct {
+	Name         string   `bson:"name" json:"name"`
+	Publisher    string   `bson:"publisher" json:"publisher"`
+	MachineCount int      `bson:"machine_count" json:"machine_count"`
+	InstallCount int      `bson:"install_count" json:"install_count"`
+	VersionCount int      `bson:"version_count" json:"version_count"`
+	Versions     []string `bson:"versions" json:"versions"`
+	SampleExe    string   `bson:"sample_exe,omitempty" json:"sample_exe,omitempty"`
+	SampleBundle string   `bson:"sample_bundle,omitempty" json:"sample_bundle,omitempty"`
+}
+
+// CatalogQuery filters the fleet-wide catalog.
+type CatalogQuery struct {
+	Search      string
+	Limit, Skip int
+}
+
+// InventoryCoverage reports how much of the fleet the inventory actually
+// covers.
+//
+// Every number derived from the inventory — a catalog count, a policy
+// simulation — is only as honest as this. "47 apps would be blocked" means
+// nothing without "and 17 of your 100 machines have never reported".
+type InventoryCoverage struct {
+	MachinesTotal    int       `json:"machines_total"`
+	MachinesReported int       `json:"machines_reported"`
+	MachinesStale    int       `json:"machines_stale"`
+	OldestReportAt   time.Time `json:"oldest_report_at,omitempty"`
+}
+
+// Application-control policy.
+//
+// Phase A stores and simulates these; nothing is enforced on any endpoint.
+// The shape is built for enforcement anyway, so that turning it on later is a
+// mode flip on an object people already understand rather than a new concept.
+
+// Policy actions.
+const (
+	ActionAllow   = "allow"
+	ActionBlock   = "block"
+	ActionElevate = "elevate"
+	// ActionDefault stops evaluation and falls through to the policy's
+	// DefaultAction — the explicit carve-out an operator needs to say "this
+	// one is none of the above".
+	ActionDefault = "default"
+)
+
+// Policy modes.
+const (
+	// ModeAudit records what would have happened and changes nothing.
+	ModeAudit = "audit"
+	// ModeEnforce acts on the decision. Phase A never resolves to this.
+	ModeEnforce = "enforce"
+)
+
+// Policy scopes, least specific first. Named with the Policy prefix because
+// InstalledApp.Scope already means something different — whether an install is
+// machine-wide or for one account — and two unrelated meanings of "machine
+// scope" in one package is how the wrong constant gets used.
+const (
+	PolicyScopeTenant  = "tenant"
+	PolicyScopeGroup   = "group"
+	PolicyScopeMachine = "machine"
+)
+
+// Install scopes, as reported by the agent for each application.
+const (
+	InstallScopeMachine = "machine"
+	InstallScopeUser    = "user"
+)
+
+// Match operators.
+const (
+	OpEquals   = "equals"
+	OpContains = "contains"
+	OpPrefix   = "prefix"
+	OpSuffix   = "suffix"
+	OpWildcard = "wildcard"
+)
+
+// AppPolicy is one named set of ordered rules applying to some machines.
+//
+// One document per policy with an ordered rule list, rather than a document
+// per rule: policies are authored, reviewed and audited as a unit, and
+// first-match-wins is only explainable if the rules are a numbered list an
+// operator can read top to bottom.
+type AppPolicy struct {
+	ID          primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	TenantID    string             `bson:"tenant_id" json:"tenant_id"`
+	Name        string             `bson:"name" json:"name"`
+	Description string             `bson:"description,omitempty" json:"description,omitempty"`
+	Enabled     bool               `bson:"enabled" json:"enabled"`
+
+	Scope PolicyScope `bson:"scope" json:"scope"`
+
+	// Mode is audit or enforce. In Phase A the resolver forces audit
+	// regardless, so a bug here cannot block anybody's software.
+	Mode string `bson:"mode" json:"mode"`
+
+	// Priority breaks ties between policies at the same scope. Higher wins.
+	Priority int `bson:"priority" json:"priority"`
+
+	// DefaultAction applies when no rule matches.
+	DefaultAction string `bson:"default_action" json:"default_action"`
+
+	Rules []PolicyRule `bson:"rules" json:"rules"`
+
+	CreatedAt time.Time `bson:"created_at" json:"created_at"`
+	UpdatedAt time.Time `bson:"updated_at" json:"updated_at"`
+	CreatedBy string    `bson:"created_by,omitempty" json:"created_by,omitempty"`
+	UpdatedBy string    `bson:"updated_by,omitempty" json:"updated_by,omitempty"`
+}
+
+// PolicyScope says which machines a policy applies to.
+type PolicyScope struct {
+	Kind     string   `bson:"kind" json:"kind"`
+	GroupIDs []string `bson:"group_ids,omitempty" json:"group_ids,omitempty"`
+	// AgentIDs, not machine ObjectIDs — agent_id is the key the rest of the
+	// fleet is addressed by.
+	AgentIDs []string `bson:"agent_ids,omitempty" json:"agent_ids,omitempty"`
+}
+
+// PolicyRule is one ordered decision.
+type PolicyRule struct {
+	// ID is stable across reordering, so simulation results and audit entries
+	// can cite a rule that is still recognisable after the list is edited.
+	ID      string        `bson:"id" json:"id"`
+	Name    string        `bson:"name" json:"name"`
+	Enabled bool          `bson:"enabled" json:"enabled"`
+	Action  string        `bson:"action" json:"action"`
+	Match   MatchCriteria `bson:"match" json:"match"`
+	Comment string        `bson:"comment,omitempty" json:"comment,omitempty"`
+}
+
+// MatchCriteria selects applications.
+//
+// Populated fields are ANDed; the values within one field are ORed. An
+// entirely empty criteria matches NOTHING — never everything. That is the
+// single most important rule here: a half-filled form must not silently become
+// a fleet-wide block.
+type MatchCriteria struct {
+	AppName   StringMatch `bson:"app_name" json:"app_name"`
+	Publisher StringMatch `bson:"publisher" json:"publisher"`
+	FilePath  StringMatch `bson:"file_path" json:"file_path"`
+	BundleID  StringMatch `bson:"bundle_id" json:"bundle_id"`
+	// SHA256 is exact, lowercase hex. Hash rules pin one exact build and stop
+	// matching the moment it is patched, which is why they are last.
+	SHA256 []string `bson:"sha256,omitempty" json:"sha256,omitempty"`
+}
+
+// StringMatch is one field's comparison.
+type StringMatch struct {
+	Op     string   `bson:"op,omitempty" json:"op,omitempty"`
+	Values []string `bson:"values,omitempty" json:"values,omitempty"`
+	// CaseSensitive is off by default. Publishers and paths arrive from
+	// registries and filesystems with inconsistent casing, and a rule that
+	// misses because of it fails silently.
+	CaseSensitive bool `bson:"case_sensitive,omitempty" json:"case_sensitive,omitempty"`
+}
+
+// Empty reports whether this field constrains anything.
+func (m StringMatch) Empty() bool {
+	for _, v := range m.Values {
+		if strings.TrimSpace(v) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// Empty reports whether the criteria constrains anything at all.
+func (c MatchCriteria) Empty() bool {
+	return c.AppName.Empty() && c.Publisher.Empty() &&
+		c.FilePath.Empty() && c.BundleID.Empty() && len(c.SHA256) == 0
+}
+
+// Remote-access policy.
+//
+// Who may connect to which machines, by what means, at what times, and under
+// what conditions. It sits BEHIND the existing ownership and allowed-user
+// checks, never in front of them: a policy can only narrow what somebody may
+// already do, never widen it. That ordering is what stops a mistyped policy
+// from handing a stranger a session.
+
+// Remote access kinds, matching the three ways in.
+const (
+	AccessAttended   = "attended"   // remote control of the user's live session
+	AccessUnattended = "unattended" // RDP/VNC, a separate desktop
+	AccessTerminal   = "terminal"   // shell
+)
+
+// RemoteAccessPolicy is one named rule set.
+type RemoteAccessPolicy struct {
+	ID          primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	TenantID    string             `bson:"tenant_id" json:"tenant_id"`
+	Name        string             `bson:"name" json:"name"`
+	Description string             `bson:"description,omitempty" json:"description,omitempty"`
+	Enabled     bool               `bson:"enabled" json:"enabled"`
+
+	Scope    PolicyScope `bson:"scope" json:"scope"`
+	Priority int         `bson:"priority" json:"priority"`
+
+	// AllowedRoles limits who may connect. Empty means any role that already
+	// passes the ownership check.
+	AllowedRoles []string `bson:"allowed_roles,omitempty" json:"allowed_roles,omitempty"`
+
+	// AllowedGroupIDs limits connection to members of these groups — the
+	// directory groups synced from Entra, so an operator writes "only the
+	// Support team" once and membership is maintained upstream.
+	AllowedGroupIDs []string `bson:"allowed_group_ids,omitempty" json:"allowed_group_ids,omitempty"`
+
+	// Which ways in are permitted. All three default to true on a new policy
+	// so that saving one does not silently cut off a route nobody considered.
+	AllowAttended   bool `bson:"allow_attended" json:"allow_attended"`
+	AllowUnattended bool `bson:"allow_unattended" json:"allow_unattended"`
+	AllowTerminal   bool `bson:"allow_terminal" json:"allow_terminal"`
+
+	// TimeWindows restrict when a session may start. Empty means any time.
+	// They gate the START only: a session already running is not cut off
+	// mid-sentence because the clock struck six.
+	TimeWindows []TimeWindow `bson:"time_windows,omitempty" json:"time_windows,omitempty"`
+
+	RequireConsent bool `bson:"require_consent" json:"require_consent"`
+	RequireReason  bool `bson:"require_reason" json:"require_reason"`
+
+	// RequireRecording refuses the session outright when recording is not
+	// configured, rather than letting an unrecorded one through. A policy that
+	// says sessions are recorded has to mean it.
+	RequireRecording bool `bson:"require_recording" json:"require_recording"`
+
+	// MaxSessionMinutes caps a session's length. Zero means no cap.
+	MaxSessionMinutes int `bson:"max_session_minutes" json:"max_session_minutes"`
+
+	CreatedAt time.Time `bson:"created_at" json:"created_at"`
+	UpdatedAt time.Time `bson:"updated_at" json:"updated_at"`
+	CreatedBy string    `bson:"created_by,omitempty" json:"created_by,omitempty"`
+	UpdatedBy string    `bson:"updated_by,omitempty" json:"updated_by,omitempty"`
+}
+
+// TimeWindow is a recurring span during which sessions may start.
+type TimeWindow struct {
+	// Days of the week, 0 = Sunday. Empty means every day.
+	Days []int `bson:"days,omitempty" json:"days,omitempty"`
+
+	// StartMinute and EndMinute are minutes from midnight in Timezone.
+	//
+	// Minutes rather than a "09:00" string because that is what comparison
+	// needs, and parsing a time string at every connection attempt is a way to
+	// fail open on a typo.
+	StartMinute int `bson:"start_minute" json:"start_minute"`
+	EndMinute   int `bson:"end_minute" json:"end_minute"`
+
+	// Timezone is an IANA name. Empty means UTC — stated, because "business
+	// hours" means nothing without one, and a support team in Pune working to
+	// a window set in UTC would find it opened at half past two in the morning.
+	Timezone string `bson:"timezone,omitempty" json:"timezone,omitempty"`
+}
+
 type ResourceStats struct {
 	CPUPercent      float64 `bson:"cpu_percent" json:"cpu_percent"`
 	MemoryPercent   float64 `bson:"memory_percent" json:"memory_percent"`
@@ -146,17 +506,92 @@ type ActivityLog struct {
 
 // AuditLog records admin and system-level actions (user creation, config changes, etc.)
 type AuditLog struct {
-	ID         primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	ActorID    string             `bson:"actor_id" json:"actor_id"`
-	ActorName  string             `bson:"actor_name" json:"actor_name"`
-	ActorRole  string             `bson:"actor_role" json:"actor_role"`
-	Action     string             `bson:"action" json:"action"`     // e.g. "user.create", "machine.delete"
-	Resource   string             `bson:"resource" json:"resource"` // e.g. "user", "machine"
-	ResourceID string             `bson:"resource_id" json:"resource_id"`
-	Details    map[string]any     `bson:"details,omitempty" json:"details,omitempty"`
-	IPAddress  string             `bson:"ip_address" json:"ip_address"`
-	Status     string             `bson:"status" json:"status"` // "success", "failure"
-	Timestamp  time.Time          `bson:"timestamp" json:"timestamp"`
+	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	ActorID   string             `bson:"actor_id" json:"actor_id"`
+	ActorName string             `bson:"actor_name" json:"actor_name"`
+	ActorRole string             `bson:"actor_role" json:"actor_role"`
+
+	// TenantID scopes the entry. Without it one organisation's audit trail
+	// cannot be separated from another's, which makes the whole log unusable
+	// for the compliance question it exists to answer.
+	TenantID string `bson:"tenant_id" json:"tenant_id"`
+
+	Action     string         `bson:"action" json:"action"`     // see the Audit* constants
+	Resource   string         `bson:"resource" json:"resource"` // "machine", "policy", "application"
+	ResourceID string         `bson:"resource_id" json:"resource_id"`
+	Details    map[string]any `bson:"details,omitempty" json:"details,omitempty"`
+	IPAddress  string         `bson:"ip_address" json:"ip_address"`
+	Status     string         `bson:"status" json:"status"` // "success", "failure", "denied"
+	Timestamp  time.Time      `bson:"timestamp" json:"timestamp"`
+
+	// MachineName and AgentID are denormalised so a listing never needs a
+	// join, and so the entry still reads correctly after a machine is removed.
+	MachineName string `bson:"machine_name,omitempty" json:"machine_name,omitempty"`
+	AgentID     string `bson:"agent_id,omitempty" json:"agent_id,omitempty"`
+}
+
+// EPM audit actions.
+//
+// The whole set is declared here, including the ones nothing emits yet, for
+// two reasons. It is the contract the compliance report and the export filter
+// against, so a reader can see what the product claims to record and what it
+// does not. And when enforcement lands, those events slot into a pipeline that
+// already exists rather than needing one designed around them.
+const (
+	// Deployment and policy distribution.
+	AuditAgentRegistered = "agent.registered"
+	AuditAgentUpdated    = "agent.updated"
+	AuditPolicySynced    = "policy.synchronized"
+
+	// Policy authoring. These are the "who changed the block rule, and when"
+	// questions, and history is the one thing that cannot be retrofitted.
+	AuditPolicyCreated = "policy.created"
+	AuditPolicyUpdated = "policy.updated"
+	AuditPolicyDeleted = "policy.deleted"
+
+	// Application control. Emitted once enforcement exists; until then the
+	// portal says plainly that nothing has been recorded rather than showing
+	// an empty list that reads like "nothing was blocked".
+	AuditAppAllowed  = "application.allowed"
+	AuditAppBlocked  = "application.blocked"
+	AuditAppElevated = "application.elevated"
+
+	// AuditAppPolicyViolation is detection, not enforcement: an application
+	// matching a block or elevate rule has been found installed. It is named
+	// apart from AuditAppBlocked on purpose — calling it "blocked" would read
+	// as evidence that execution was prevented, which it was not.
+	AuditAppPolicyViolation = "application.policy_violation"
+
+	// Just-in-time access.
+	AuditJITRequested = "jit.requested"
+	AuditJITApproved  = "jit.approved"
+	AuditJITRejected  = "jit.rejected"
+	AuditJITExpired   = "jit.expired"
+
+	// Sudo. Also awaiting enforcement.
+	AuditSudoExecuted = "sudo.executed"
+	AuditSudoDenied   = "sudo.denied"
+
+	// Remote access.
+	AuditRemoteStarted = "remote_control.start"
+	AuditRemoteStopped = "remote_control.stop"
+	AuditRemoteRefused = "remote_access.refused"
+
+	// Inventory.
+	AuditInventoryReported = "inventory.reported"
+)
+
+// AuditQuery filters an audit listing.
+type AuditQuery struct {
+	TenantID string
+	Actions  []string
+	Actor    string
+	AgentID  string
+	Status   string
+	Search   string
+	From, To time.Time
+	Limit    int
+	Skip     int
 }
 
 type Issue struct {
@@ -418,6 +853,11 @@ type Store interface {
 	GetSessionsOlderThan(before time.Time, limit int) ([]*Session, error)
 	DeleteSessionsByIDs(ids []primitive.ObjectID) (int64, error)
 	GetAuditLogsOlderThan(before time.Time, limit int) ([]*AuditLog, error)
+	GetAuditLogs(q AuditQuery) ([]*AuditLog, error)
+	CountAuditLogs(q AuditQuery) (int64, error)
+	StreamAuditLogs(ctx context.Context, q AuditQuery, fn func(*AuditLog) error) error
+	CountAuditByAction(q AuditQuery) ([]AuditActionCount, error)
+	CountAuditByActor(q AuditQuery, limit int) ([]AuditActorCount, error)
 	DeleteAuditLogsByIDs(ids []primitive.ObjectID) (int64, error)
 	CreateAuditLog(log *AuditLog) error
 	CreateArchiveRun(run *ArchiveRun) error
@@ -446,6 +886,38 @@ type Store interface {
 	GetActiveAccessEvents(machineID primitive.ObjectID) ([]*AccessEvent, error)
 	GetAccessEventsByMachine(machineID primitive.ObjectID, limit, skip int) ([]*AccessEvent, error)
 	CountAccessEventsByMachine(machineID primitive.ObjectID) (int64, error)
+
+	// Installed-application inventory.
+	//
+	// The write path is deliberately two calls: chunks are upserted as they
+	// arrive, and the removal sweep runs separately and only for a complete
+	// scan. Folding them together would make it possible to mark software
+	// removed on the strength of a partial report.
+	UpsertInventoryChunk(machine *Machine, scanID string, apps []InstalledApp, at time.Time) (added, updated int64, newApps []InstalledApp, err error)
+	SweepRemovedApps(agentID, scanID string, at time.Time) (int64, error)
+	CreateInventoryScan(scan *InventoryScan) error
+	UpdateInventoryScan(agentID, scanID string, added, updated, removed int64, reported int, complete bool, at time.Time) error
+	GetLatestInventoryScan(agentID string) (*InventoryScan, error)
+	GetInstalledAppsByMachine(machineID primitive.ObjectID, q InventoryQuery) ([]*InstalledApp, error)
+	CountInstalledAppsByMachine(machineID primitive.ObjectID, q InventoryQuery) (int64, error)
+	StreamInstalledAppsByTenant(ctx context.Context, tenantID string, fn func(*InstalledApp) error) error
+	GetAppCatalog(tenantID string, q CatalogQuery) ([]CatalogEntry, int64, error)
+	GetMachinesWithApp(tenantID, name, publisher string, limit, skip int) ([]*InstalledApp, int64, error)
+	GetInventoryCoverage(tenantID string, staleAfter time.Duration) (InventoryCoverage, error)
+
+	// Application-control policies.
+	CreateAppPolicy(p *AppPolicy) error
+	UpdateAppPolicy(p *AppPolicy) error
+	DeleteAppPolicy(tenantID string, id primitive.ObjectID) error
+	GetAppPolicyByID(tenantID string, id primitive.ObjectID) (*AppPolicy, error)
+	GetAppPoliciesByTenant(tenantID string) ([]*AppPolicy, error)
+
+	// Remote-access policies.
+	CreateRemoteAccessPolicy(p *RemoteAccessPolicy) error
+	UpdateRemoteAccessPolicy(p *RemoteAccessPolicy) error
+	DeleteRemoteAccessPolicy(tenantID string, id primitive.ObjectID) error
+	GetRemoteAccessPolicyByID(tenantID string, id primitive.ObjectID) (*RemoteAccessPolicy, error)
+	GetRemoteAccessPoliciesByTenant(tenantID string) ([]*RemoteAccessPolicy, error)
 	AddMachineNotifyEmail(machineID primitive.ObjectID, email string) error
 
 	// Agent process stats (Agent Monitoring)

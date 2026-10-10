@@ -122,6 +122,15 @@ func (h *Handler) CreateAccessRequest(c *gin.Context) {
 		}()
 	}
 
+	h.record(c, auditEntry{
+		Action: store.AuditJITRequested, Resource: "access_request",
+		ResourceID: accessReq.ID.Hex(),
+		Details: map[string]any{
+			"machine":        accessReq.MachineName,
+			"duration_hours": accessReq.DurationHours,
+			"note":           accessReq.RequestNote,
+		},
+	})
 	c.JSON(http.StatusCreated, accessReq)
 }
 
@@ -285,6 +294,16 @@ func (h *Handler) ApproveAccessRequest(c *gin.Context) {
 		}()
 	}
 
+	h.record(c, auditEntry{
+		Action: store.AuditJITApproved, Resource: "access_request",
+		ResourceID: ar.ID.Hex(),
+		Details: map[string]any{
+			"requester":      ar.RequesterUsername,
+			"machine":        ar.MachineName,
+			"duration_hours": ar.DurationHours,
+			"expires_at":     ar.ExpiresAt,
+		},
+	})
 	c.JSON(http.StatusOK, gin.H{"message": "access request approved", "request": ar})
 }
 
@@ -365,6 +384,15 @@ func (h *Handler) RejectAccessRequest(c *gin.Context) {
 		}()
 	}
 
+	h.record(c, auditEntry{
+		Action: store.AuditJITRejected, Resource: "access_request",
+		ResourceID: ar.ID.Hex(), Status: "denied",
+		Details: map[string]any{
+			"requester": ar.RequesterUsername,
+			"machine":   ar.MachineName,
+			"comment":   ar.RejectComment,
+		},
+	})
 	c.JSON(http.StatusOK, gin.H{"message": "access request rejected", "request": ar})
 }
 
@@ -476,5 +504,14 @@ func (h *Handler) RevokeAccessRequest(c *gin.Context) {
 		}()
 	}
 
+	h.record(c, auditEntry{
+		Action: store.AuditJITExpired, Resource: "access_request",
+		ResourceID: ar.ID.Hex(), Status: "denied",
+		Details: map[string]any{
+			"requester": ar.RequesterUsername,
+			"machine":   ar.MachineName,
+			"revoked":   true,
+		},
+	})
 	c.JSON(http.StatusOK, gin.H{"message": "access request revoked", "request": ar})
 }

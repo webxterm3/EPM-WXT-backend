@@ -12,20 +12,24 @@ import (
 )
 
 type MongoDB struct {
-	client             *mongo.Client
-	db                 *mongo.Database
-	Machines           *mongo.Collection
-	Logs               *mongo.Collection
-	Sessions           *mongo.Collection
-	Issues             *mongo.Collection
-	Fixes              *mongo.Collection
-	TenantConfigs      *mongo.Collection
-	Recordings         *mongo.Collection
-	LogManagementConfs *mongo.Collection
-	ArchiveRuns        *mongo.Collection
-	AuditLogs          *mongo.Collection
-	AccessRequests     *mongo.Collection
-	AccessEvents       *mongo.Collection
+	client               *mongo.Client
+	db                   *mongo.Database
+	Machines             *mongo.Collection
+	Logs                 *mongo.Collection
+	Sessions             *mongo.Collection
+	Issues               *mongo.Collection
+	Fixes                *mongo.Collection
+	TenantConfigs        *mongo.Collection
+	Recordings           *mongo.Collection
+	LogManagementConfs   *mongo.Collection
+	ArchiveRuns          *mongo.Collection
+	AuditLogs            *mongo.Collection
+	AccessRequests       *mongo.Collection
+	AccessEvents         *mongo.Collection
+	InstalledApps        *mongo.Collection
+	InventoryScans       *mongo.Collection
+	AppPolicies          *mongo.Collection
+	RemoteAccessPolicies *mongo.Collection
 }
 
 func NewMongoDB(uri, dbName string) (*MongoDB, error) {
@@ -43,20 +47,24 @@ func NewMongoDB(uri, dbName string) (*MongoDB, error) {
 
 	db := client.Database(dbName)
 	store := &MongoDB{
-		client:             client,
-		db:                 db,
-		Machines:           db.Collection("machines"),
-		Logs:               db.Collection("logs"),
-		Sessions:           db.Collection("sessions"),
-		Issues:             db.Collection("issues"),
-		Fixes:              db.Collection("fixes"),
-		TenantConfigs:      db.Collection("tenant_configs"),
-		Recordings:         db.Collection("session_recordings"),
-		LogManagementConfs: db.Collection("log_management_config"),
-		ArchiveRuns:        db.Collection("archive_runs"),
-		AuditLogs:          db.Collection("audit_logs"),
-		AccessRequests:     db.Collection("access_requests"),
-		AccessEvents:       db.Collection("access_events"),
+		client:               client,
+		db:                   db,
+		Machines:             db.Collection("machines"),
+		Logs:                 db.Collection("logs"),
+		Sessions:             db.Collection("sessions"),
+		Issues:               db.Collection("issues"),
+		Fixes:                db.Collection("fixes"),
+		TenantConfigs:        db.Collection("tenant_configs"),
+		Recordings:           db.Collection("session_recordings"),
+		LogManagementConfs:   db.Collection("log_management_config"),
+		ArchiveRuns:          db.Collection("archive_runs"),
+		AuditLogs:            db.Collection("audit_logs"),
+		AccessRequests:       db.Collection("access_requests"),
+		AccessEvents:         db.Collection("access_events"),
+		InstalledApps:        db.Collection("installed_apps"),
+		InventoryScans:       db.Collection("inventory_scans"),
+		AppPolicies:          db.Collection("app_policies"),
+		RemoteAccessPolicies: db.Collection("remote_access_policies"),
 	}
 
 	// Create indexes
@@ -83,6 +91,79 @@ func (m *MongoDB) ensureIndexes(ctx context.Context) error {
 		{Keys: bson.D{{Key: "owner_id", Value: 1}}},
 		{Keys: bson.D{{Key: "status", Value: 1}}},
 		{Keys: bson.D{{Key: "registration_token", Value: 1}}, Options: options.Index().SetSparse(true)},
+		// GetMachinesByTenantID was a collection scan. Policy resolution and
+		// inventory simulation both call it per request.
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "status", Value: 1}}},
+	})
+	if err != nil {
+		return err
+	}
+
+	// Installed-application inventory.
+	//
+	// The {agent_id, app_key} index is unique on purpose: it is what makes a
+	// repeated snapshot idempotent. With it, an agent restarting and
+	// re-reporting is a no-op by construction rather than something a handler
+	// has to remember to check — which is how the duplicate access-event bug
+	// happened.
+	_, err = m.InstalledApps.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "agent_id", Value: 1}, {Key: "app_key", Value: 1}}, Options: options.Index().SetUnique(true)},
+		{Keys: bson.D{{Key: "agent_id", Value: 1}, {Key: "present", Value: 1}, {Key: "name_lower", Value: 1}}},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "present", Value: 1}, {Key: "name_lower", Value: 1}}},
+		{Keys: bson.D{{Key: "machine_id", Value: 1}, {Key: "present", Value: 1}}},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "removed_at", Value: -1}}, Options: options.Index().SetSparse(true)},
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = m.AppPolicies.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "enabled", Value: 1}}},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "scope.group_ids", Value: 1}}, Options: options.Index().SetSparse(true)},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "scope.agent_ids", Value: 1}}, Options: options.Index().SetSparse(true)},
+		// Two policies called "Block Games" in one tenant is a mistake, not a
+		// configuration — and an operator reading an audit entry needs the
+		// name to identify one policy.
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "name", Value: 1}}, Options: options.Index().SetUnique(true)},
+	})
+	if err != nil {
+		return err
+	}
+
+	// Audit entries are queried by tenant and time on every listing, every
+	// export and every compliance report.
+	_, err = m.AuditLogs.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "timestamp", Value: -1}}},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "action", Value: 1}, {Key: "timestamp", Value: -1}}},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "agent_id", Value: 1}, {Key: "timestamp", Value: -1}}},
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = m.RemoteAccessPolicies.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "enabled", Value: 1}}},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "scope.group_ids", Value: 1}}, Options: options.Index().SetSparse(true)},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "scope.agent_ids", Value: 1}}, Options: options.Index().SetSparse(true)},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "name", Value: 1}}, Options: options.Index().SetUnique(true)},
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = m.InventoryScans.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "agent_id", Value: 1}, {Key: "started_at", Value: -1}}},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "started_at", Value: -1}}},
+	})
+	if err != nil {
+		return err
+	}
+
+	// access_events had no indexes at all, despite HasActiveAccessEvent
+	// running this exact lookup on every reported login.
+	_, err = m.AccessEvents.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "agent_id", Value: 1}, {Key: "active", Value: 1}, {Key: "os_user", Value: 1}, {Key: "line", Value: 1}}},
+		{Keys: bson.D{{Key: "machine_id", Value: 1}, {Key: "login_at", Value: -1}}},
 	})
 	if err != nil {
 		return err
@@ -773,19 +854,47 @@ func (m *MongoDB) GetMachinesSharedWithUser(username string) ([]*Machine, error)
 }
 
 // DeleteMachine deletes a machine and all associated logs
+// DeleteMachine removes a machine and everything scoped to it.
+//
+// It used to delete only the machine document and its logs, which left the
+// inventory, scans, sessions and login history behind. That is not merely
+// untidy: a machine re-enrolled against the same registration token gets the
+// same agent_id, so the orphaned rows match it again and its first scan
+// reports "0 added" for software it has never reported before.
+//
+// Audit entries are deliberately NOT deleted — they record what people did,
+// and that outlives the machine they did it to.
 func (m *MongoDB) DeleteMachine(machineID primitive.ObjectID) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	// Delete the machine
-	_, err := m.Machines.DeleteOne(ctx, bson.M{"_id": machineID})
-	if err != nil {
+	var machine Machine
+	// Read the agent id before deleting: the inventory is keyed on it, not on
+	// the machine's own id.
+	_ = m.Machines.FindOne(ctx, bson.M{"_id": machineID}).Decode(&machine)
+
+	if _, err := m.Machines.DeleteOne(ctx, bson.M{"_id": machineID}); err != nil {
 		return err
 	}
 
-	// Delete all logs for this machine
-	_, err = m.Logs.DeleteMany(ctx, bson.M{"machine_id": machineID})
-	return err
+	byMachine := bson.M{"machine_id": machineID}
+	for _, c := range []*mongo.Collection{
+		m.Logs, m.Sessions, m.Recordings, m.AccessEvents, m.AccessRequests, m.InstalledApps,
+	} {
+		if _, err := c.DeleteMany(ctx, byMachine); err != nil {
+			return err
+		}
+	}
+
+	if machine.AgentID != "" {
+		byAgent := bson.M{"agent_id": machine.AgentID}
+		for _, c := range []*mongo.Collection{m.InstalledApps, m.InventoryScans} {
+			if _, err := c.DeleteMany(ctx, byAgent); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // DeleteLogsByMachine deletes all logs for a specific machine
