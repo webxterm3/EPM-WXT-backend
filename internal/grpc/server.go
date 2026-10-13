@@ -28,6 +28,15 @@ type AgentServer struct {
 	rdpHandler      RDPDataHandler
 	rcHandler       RDPDataHandler
 	email           *email.Service
+
+	// policyPusher is shared with the API layer, so the on-connect push and
+	// the admin-save push resolve a machine's policy the same way.
+	policyPusher *PolicyPusher
+}
+
+// SetPolicyPusher wires in the shared resolver/pusher.
+func (s *AgentServer) SetPolicyPusher(p *PolicyPusher) {
+	s.policyPusher = p
 }
 
 // TerminalManager interface for forwarding terminal output
@@ -404,6 +413,10 @@ func (s *AgentServer) Stream(stream agentv1.AgentService_StreamServer) error {
 	// operator turned collection off, which is the direction that matters.
 	if machineErr == nil && machine != nil {
 		go s.sendLogShipPolicy(conn, machine.TenantID, agentID)
+
+		// The application policy, for the same reason: a machine that was off
+		// when a policy changed must not keep running the previous one.
+		go s.sendAppPolicy(machine)
 	}
 
 	// Handle incoming messages from Agent
@@ -574,6 +587,23 @@ func (s *AgentServer) Stream(stream agentv1.AgentService_StreamServer) error {
 //
 // The short delay mirrors the init-script path: the stream's send loop needs a
 // moment to start, and a message queued before it does is dropped.
+// sendAppPolicy delivers the machine's application-control policy on connect.
+//
+// Delayed like the log-shipping push: the agent has just registered and is
+// still setting up its own loops, and a command that arrives before its
+// handler is listening is simply dropped.
+func (s *AgentServer) sendAppPolicy(machine *store.Machine) {
+	if s.policyPusher == nil {
+		return
+	}
+	time.Sleep(2 * time.Second)
+
+	if err := s.policyPusher.PushTo(machine); err != nil {
+		s.logger.Warn("could not send the application policy on connect",
+			zap.String("agent_id", machine.AgentID), zap.Error(err))
+	}
+}
+
 func (s *AgentServer) sendLogShipPolicy(conn *AgentConnection, tenantID, agentID string) {
 	time.Sleep(2 * time.Second)
 

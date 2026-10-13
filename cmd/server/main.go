@@ -173,7 +173,13 @@ func main() {
 
 	// HTTP Handler (create early to wire terminal manager)
 	// Auth is now handled by vsay-auth gateway, no local auth service needed
+	// One pusher, shared by the API layer (on save) and the gRPC server (on
+	// connect). Built from api.EnforcementEnabled so a machine can never be
+	// sent an enforcing policy while the product reports enforcement as off.
+	policyPusher := grpc.NewPolicyPusher(st, agentManager, api.EnforcementEnabled, logger)
+
 	h := api.NewHandler(st, agentManager, uploadService, logger)
+	h.SetPolicyPusher(policyPusher)
 
 	// RDP tunnel manager (remote-desktop feature) — bridges guacd ↔ agent tunnel.
 	rdpManager := api.NewRDPManager(agentManager, st, logger)
@@ -196,6 +202,8 @@ func main() {
 	logger.Info("gRPC server configured with mTLS (dynamic per-connection, TLS 1.3)")
 
 	agentServer := grpc.NewAgentServer(st, agentManager, logger)
+
+	agentServer.SetPolicyPusher(policyPusher)
 	agentServer.SetTerminalManager(h.GetTerminalManager()) // Wire terminal manager
 	agentServer.SetRDPHandler(rdpManager)                  // Route rdp_ session output to RDP tunnels
 	agentServer.SetRemoteControlHandler(rcManager)         // Route rc_ session output to remote control
@@ -338,6 +346,20 @@ func main() {
 	if agentBinariesDir == "" {
 		agentBinariesDir = "./agent-binaries"
 	}
+	// The macOS terminal installer, at a short URL so the one-liner is
+	// readable. Served as text/plain, not an attachment, because it is piped
+	// straight into bash — a Content-Disposition here would have curl write a
+	// file instead.
+	r.GET("/agent/install-macos.sh", func(c *gin.Context) {
+		path := filepath.Join(agentBinariesDir, "install-macos.sh")
+		if _, err := os.Stat(path); err != nil { // #nosec G703 -- fixed filename
+			c.String(http.StatusNotFound, "# installer not available on this deployment\n")
+			return
+		}
+		c.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+		c.File(path)
+	})
+
 	r.GET("/agent/download/:filename", func(c *gin.Context) {
 		filename := filepath.Base(c.Param("filename"))
 		if filename == "." || filename == "" || strings.Contains(filename, "/") {
@@ -345,10 +367,33 @@ func main() {
 			return
 		}
 		filePath := filepath.Join(agentBinariesDir, filename)
-		if _, err := os.Stat(filePath); os.IsNotExist(err) { // #nosec G703 -- filename already sanitized above (filepath.Base + "/" rejected)
+		info, err := os.Stat(filePath) // #nosec G703 -- filename already sanitized above (filepath.Base + "/" rejected)
+		if os.IsNotExist(err) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "package not found: " + filename})
 			return
 		}
+
+		// Never cached.
+		//
+		// The filename is stable — wxt-agent-arm64.dmg is always the current
+		// build — so a cached copy is served for ever and every new release is
+		// invisible. Somebody downloads what looks like the fix, installs it,
+		// and reports the bug it was supposed to fix, which is a very
+		// expensive way to find out a browser kept the old file.
+		//
+		// Without an explicit Cache-Control a browser applies heuristic
+		// caching based on Last-Modified, which for a file that changes under
+		// the same name is exactly the wrong guess.
+		c.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+		c.Header("Pragma", "no-cache")
+		c.Header("Expires", "0")
+
+		// When this build was produced, so a support conversation can settle
+		// "are you running the new one?" without guesswork.
+		if info != nil {
+			c.Header("X-Agent-Build-Time", info.ModTime().UTC().Format(time.RFC3339))
+		}
+
 		c.FileAttachment(filePath, filename)
 	})
 
@@ -434,7 +479,9 @@ func main() {
 		// Installed-application inventory. Read-only in Phase A: the agent
 		// reports, the portal displays, nothing is enforced on any endpoint.
 		auth.GET("/machines/:agent_id/applications", h.GetMachineApplications)
+		auth.POST("/machines/:agent_id/applications/scan", h.RequestMachineInventoryScan)
 		auth.GET("/applications/catalog", h.GetAppCatalog)
+		auth.POST("/applications/scan", h.RequestFleetInventoryScan)
 		auth.GET("/applications/machines", h.GetMachinesWithApp)
 
 		// Application-control policies. Authored and projected in Phase A;

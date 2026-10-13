@@ -15,10 +15,15 @@ import (
 // inventoryStaleAfter is when a machine's last report stops being current
 // enough to reason about.
 //
-// Agents scan every 12 hours, so a machine that has not reported in a day is
-// either off or not reporting. The number matters because every count the
-// portal shows is only as honest as the share of the fleet behind it.
-const inventoryStaleAfter = 24 * time.Hour
+// Agents scan every 24 hours, so this must be comfortably MORE than a day: at
+// exactly 24h a machine reporting perfectly on schedule would be called stale
+// in the minutes before each scan, and the coverage notice would permanently
+// accuse a healthy fleet of not reporting. 36 hours means one missed scan is
+// tolerated and a second one is not.
+//
+// The number matters because every count the portal shows is only as honest as
+// the share of the fleet behind it.
+const inventoryStaleAfter = 36 * time.Hour
 
 // GetMachineApplications lists the software installed on one machine.
 // GET /api/machines/:agent_id/applications
@@ -59,6 +64,104 @@ func (h *Handler) GetMachineApplications(c *gin.Context) {
 		"applications": apps,
 		"total":        total,
 		"last_scan":    scan,
+	})
+}
+
+// RequestMachineInventoryScan asks one machine to re-scan its software now.
+// POST /api/machines/:agent_id/applications/scan
+//
+// The response says only that the request was delivered. It cannot say the
+// scan succeeded, because the agent reports through the ordinary inventory
+// channel some seconds later — and claiming otherwise would have the UI show
+// a stale list under the word "done".
+func (h *Handler) RequestMachineInventoryScan(c *gin.Context) {
+	machine, ok := h.authorizeMachineRead(c)
+	if !ok {
+		return
+	}
+
+	if !h.agentManager.IsAgentConnected(machine.AgentID) {
+		// 409, not 500: nothing is broken. The machine is off or offline, and
+		// the caller needs to be told which of the two situations this is.
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "This machine is offline. Its software list will refresh on its own when the agent reconnects.",
+		})
+		return
+	}
+
+	if err := h.agentManager.SendInventoryScan(machine.AgentID); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Could not reach the agent: " + err.Error()})
+		return
+	}
+
+	h.record(c, auditEntry{
+		Action: store.AuditInventoryScanRequested, Resource: "machine",
+		ResourceID: machine.AgentID,
+		Machine:    machine,
+	})
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"requested": true,
+		"message":   "Scan requested. The list updates when the agent reports back.",
+	})
+}
+
+// RequestFleetInventoryScan asks every connected machine in the tenant to
+// re-scan its software now.
+// POST /api/applications/scan
+//
+// Offline machines are counted, not failed. A fleet always has some machines
+// asleep, and an error because one laptop in a bag did not answer would make
+// the button useless on any real estate — while hiding the number would make
+// the result look complete when it is not.
+func (h *Handler) RequestFleetInventoryScan(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id not found in context"})
+		return
+	}
+
+	// Scanning the whole fleet is an administrator's action: it is cheap per
+	// machine and noisy across hundreds of them.
+	if role := c.GetString("role"); role != "company_admin" && role != "super_admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only an administrator can scan the whole fleet"})
+		return
+	}
+
+	machines, err := h.store.GetMachinesByTenantID(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load machines"})
+		return
+	}
+
+	var requested, offline int
+	var failed []string
+	for _, m := range machines {
+		if !h.agentManager.IsAgentConnected(m.AgentID) {
+			offline++
+			continue
+		}
+		if err := h.agentManager.SendInventoryScan(m.AgentID); err != nil {
+			// One unreachable agent costs that machine, not the sweep.
+			failed = append(failed, m.Name)
+			continue
+		}
+		requested++
+	}
+
+	h.record(c, auditEntry{
+		Action: store.AuditInventoryScanRequested, Resource: "fleet",
+		ResourceID: tenantID,
+		Details: map[string]any{
+			"requested": requested, "offline": offline, "failed": len(failed),
+		},
+	})
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"requested": requested,
+		"offline":   offline,
+		"failed":    failed,
+		"total":     len(machines),
 	})
 }
 

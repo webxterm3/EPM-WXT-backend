@@ -39,48 +39,9 @@ func (m *MongoDB) UpsertInventoryChunk(machine *Machine, scanID string, apps []I
 	deduped := dedupeByAppKey(apps)
 	models := make([]mongo.WriteModel, 0, len(deduped))
 	for _, app := range deduped {
-		// $set and $setOnInsert must not name the same field — Mongo rejects
-		// the update outright if they do. first_seen belongs only to insert,
-		// last_seen only to set.
-		set := bson.M{
-			"machine_name": machine.Name,
-			"tenant_id":    machine.TenantID,
-			"name":         app.Name,
-			"name_lower":   strings.ToLower(app.Name),
-			"version":      app.Version,
-			"publisher":    app.Publisher,
-			"install_path": app.InstallPath,
-			"exe_path":     app.ExePath,
-			"bundle_id":    app.BundleID,
-			"source":       app.Source,
-			"scope":        app.Scope,
-			"os_user":      app.OSUser,
-			"arch":         app.Arch,
-			"last_seen":    at,
-			"present":      true,
-			"scan_id":      scanID,
-			"updated_at":   at,
-		}
-		if app.Publisher != "" {
-			set["publisher_lower"] = strings.ToLower(app.Publisher)
-		}
-		if app.InstalledAt != nil {
-			set["installed_at"] = app.InstalledAt
-		}
-
 		models = append(models, mongo.NewUpdateOneModel().
 			SetFilter(bson.M{"agent_id": machine.AgentID, "app_key": app.AppKey}).
-			SetUpdate(bson.M{
-				"$set": set,
-				"$setOnInsert": bson.M{
-					"agent_id":   machine.AgentID,
-					"app_key":    app.AppKey,
-					"first_seen": at,
-				},
-				// A reinstall has to clear the tombstone, or the row stays
-				// marked as removed while plainly being present.
-				"$unset": bson.M{"removed_at": ""},
-			}).
+			SetUpdate(inventoryUpdate(machine, app, scanID, at)).
 			SetUpsert(true))
 	}
 
@@ -143,6 +104,61 @@ func (m *MongoDB) SweepRemovedApps(agentID, scanID string, at time.Time) (int64,
 		return 0, fmt.Errorf("sweeping removed applications: %w", err)
 	}
 	return res.ModifiedCount, nil
+}
+
+// inventoryUpdate builds the upsert document for one application.
+//
+// Extracted from UpsertInventoryChunk so it can be checked against
+// inventoryFilter without a database. The two have to agree about which
+// fields exist on a row, and when they silently disagreed — machine_id was
+// filtered on but never written — every machine's Applications tab came back
+// empty while the agent reported happily twice a day.
+func inventoryUpdate(machine *Machine, app InstalledApp, scanID string, at time.Time) bson.M {
+	// $set and $setOnInsert must not name the same field — Mongo rejects
+	// the update outright if they do. first_seen belongs only to insert,
+	// last_seen only to set.
+	set := bson.M{
+		// machine_id is $set, not $setOnInsert: a machine deleted and
+		// re-enrolled against the same registration token gets the same
+		// agent_id, so these rows survive and match again — but with the OLD
+		// machine_id, which no longer exists.
+		"machine_id":   machine.ID,
+		"machine_name": machine.Name,
+		"tenant_id":    machine.TenantID,
+		"name":         app.Name,
+		"name_lower":   strings.ToLower(app.Name),
+		"version":      app.Version,
+		"publisher":    app.Publisher,
+		"install_path": app.InstallPath,
+		"exe_path":     app.ExePath,
+		"bundle_id":    app.BundleID,
+		"source":       app.Source,
+		"scope":        app.Scope,
+		"os_user":      app.OSUser,
+		"arch":         app.Arch,
+		"last_seen":    at,
+		"present":      true,
+		"scan_id":      scanID,
+		"updated_at":   at,
+	}
+	if app.Publisher != "" {
+		set["publisher_lower"] = strings.ToLower(app.Publisher)
+	}
+	if app.InstalledAt != nil {
+		set["installed_at"] = app.InstalledAt
+	}
+
+	return bson.M{
+		"$set": set,
+		"$setOnInsert": bson.M{
+			"agent_id":   machine.AgentID,
+			"app_key":    app.AppKey,
+			"first_seen": at,
+		},
+		// A reinstall has to clear the tombstone, or the row stays marked as
+		// removed while plainly being present.
+		"$unset": bson.M{"removed_at": ""},
+	}
 }
 
 // inventoryFilter builds the per-machine listing filter.

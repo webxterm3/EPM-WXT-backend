@@ -305,6 +305,76 @@ func (m *AgentManager) SendLogShipConfig(agentID string, settingsJSON string) er
 	}
 }
 
+// AppPolicyCommandID carries the machine's effective application-control
+// policy. It must match the constant the agent routes on; the drift test in
+// the store package reads the agent source to check that it still does.
+const AppPolicyCommandID = "__vsay_apppolicy__"
+
+// SendAppPolicy pushes one machine's resolved application policy to it.
+//
+// policyJSON is a serialised policy.Effective. The agent writes it to disk
+// before applying it, so a machine keeps the policy it was given across
+// restarts rather than running unpoliced until the next connect.
+//
+// Until this existed the policy engine was complete and unreachable: policies
+// were authored, resolved and simulated entirely server-side, and no endpoint
+// ever heard about them.
+func (m *AgentManager) SendAppPolicy(agentID string, policyJSON string) error {
+	conn := m.GetConnection(agentID)
+	if conn == nil {
+		return fmt.Errorf("agent not connected")
+	}
+
+	msg := &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_Command{
+			Command: &agentv1.CommandRequest{
+				CommandId: AppPolicyCommandID,
+				Command:   policyJSON,
+			},
+		},
+	}
+
+	select {
+	case conn.InputChan <- msg:
+		return nil
+	case <-time.After(time.Second):
+		return fmt.Errorf("timeout sending the application policy to agent")
+	}
+}
+
+// InventoryScanCommandID asks an agent to re-scan its installed software now.
+// It must match the constant the agent routes on; the drift test in the store
+// package reads the agent source to check that it still does.
+const InventoryScanCommandID = "__vsay_inventory_scan__"
+
+// SendInventoryScan asks a connected agent to scan its software immediately.
+//
+// There is no payload and no reply: the agent reports the result through the
+// ordinary inventory channel, exactly as it does for a scheduled scan. That is
+// what keeps one code path for "software was reported" rather than a second
+// one that only on-demand scans ever take.
+func (m *AgentManager) SendInventoryScan(agentID string) error {
+	conn := m.GetConnection(agentID)
+	if conn == nil {
+		return fmt.Errorf("agent not connected")
+	}
+
+	msg := &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_Command{
+			Command: &agentv1.CommandRequest{
+				CommandId: InventoryScanCommandID,
+			},
+		},
+	}
+
+	select {
+	case conn.InputChan <- msg:
+		return nil
+	case <-time.After(time.Second):
+		return fmt.Errorf("timeout asking the agent to scan")
+	}
+}
+
 // KickAgent forcibly closes the gRPC connection for a specific agent.
 // Used after machine revocation to immediately cut off access.
 // The agent's reconnect loop will attempt to re-register, which will fail

@@ -579,6 +579,12 @@ const (
 
 	// Inventory.
 	AuditInventoryReported = "inventory.reported"
+
+	// AuditInventoryScanRequested records an operator asking for a scan, which
+	// is a separate fact from the scan arriving: a request with no
+	// inventory.reported after it is how "the agent is connected but wedged"
+	// shows up in the trail.
+	AuditInventoryScanRequested = "inventory.scan_requested"
 )
 
 // AuditQuery filters an audit listing.

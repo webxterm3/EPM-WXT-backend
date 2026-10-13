@@ -16,14 +16,21 @@ import (
 	"github.com/vsay/vsay-agent-backend/internal/store"
 )
 
-// enforcementEnabled is the global kill switch for application control.
+// EnforcementEnabled is the global kill switch for application control.
 //
-// It is false for the whole of Phase A: policies are authored and simulated,
-// and nothing is enforced on any endpoint. Keeping it as one named constant
-// read in one place means a bug anywhere else in the policy path still cannot
-// block somebody's software, and switching it on later is one deliberate
-// change rather than an archaeology exercise.
-const enforcementEnabled = false
+// It is false for the whole of Phase A: policies are authored, delivered to
+// endpoints and simulated, and nothing is enforced. Keeping it as one named
+// constant read in one place means a bug anywhere else in the policy path
+// still cannot block somebody's software, and switching it on later is one
+// deliberate change rather than an archaeology exercise.
+//
+// Exported because main.go hands it to the policy pusher: the agent is told
+// the mode along with the rules, so the machine that would do the blocking
+// reads the same switch as the portal that reports it.
+const EnforcementEnabled = false
+
+// enforcementEnabled is the unexported spelling used throughout this file.
+const enforcementEnabled = EnforcementEnabled
 
 // simulationTimeout bounds one projection. A tenant with a very large fleet
 // should get a clear failure rather than a request that hangs.
@@ -100,6 +107,7 @@ func (h *Handler) CreateAppPolicy(c *gin.Context) {
 			"default_action": p.DefaultAction, "enabled": p.Enabled,
 		},
 	})
+	h.pushPolicyToFleet(c)
 	c.JSON(http.StatusCreated, p)
 }
 
@@ -140,6 +148,7 @@ func (h *Handler) UpdateAppPolicy(c *gin.Context) {
 			"default_action": p.DefaultAction, "enabled": p.Enabled,
 		},
 	})
+	h.pushPolicyToFleet(c)
 	c.JSON(http.StatusOK, p)
 }
 
@@ -173,7 +182,33 @@ func (h *Handler) DeleteAppPolicy(c *gin.Context) {
 		Action: store.AuditPolicyDeleted, Resource: "application_policy",
 		ResourceID: id.Hex(), Details: details,
 	})
+	h.pushPolicyToFleet(c)
 	c.JSON(http.StatusOK, gin.H{"message": "Policy deleted"})
+}
+
+// pushPolicyToFleet delivers the tenant's policy to every connected machine.
+//
+// Called after every change, because a policy that exists only in the database
+// governs nothing. Offline machines are not chased: they are sent the current
+// policy when they next connect, through the same resolver.
+//
+// A failure here never fails the request. The policy IS saved, the portal
+// should say so, and the push retries on the machine's next connect — whereas
+// returning an error after a successful write would leave the operator unsure
+// whether to press the button again.
+func (h *Handler) pushPolicyToFleet(c *gin.Context) {
+	if h.policyPusher == nil {
+		return
+	}
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		return
+	}
+
+	pushed, failed := h.policyPusher.PushToTenant(tenantID)
+	h.logger.Info("application policy pushed",
+		zap.String("tenant_id", tenantID),
+		zap.Int("pushed", pushed), zap.Int("failed", failed))
 }
 
 // SimulateAppPolicy handles POST /api/app-policies/simulate.

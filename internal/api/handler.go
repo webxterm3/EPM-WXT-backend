@@ -19,11 +19,19 @@ import (
 type Handler struct {
 	store           store.Store
 	agentManager    *grpc.AgentManager
+	// policyPusher resolves and delivers application policy. Shared with the
+	// gRPC server so the save path and the connect path cannot disagree.
+	policyPusher *grpc.PolicyPusher
 	terminalManager *TerminalManager
 	uploadService   *upload.Service
 	rdpManager      *RDPManager
 	remoteControl   *RemoteControlManager
 	logger          *zap.Logger
+}
+
+// SetPolicyPusher wires in the shared policy resolver/pusher.
+func (h *Handler) SetPolicyPusher(p *grpc.PolicyPusher) {
+	h.policyPusher = p
 }
 
 func NewHandler(s store.Store, am *grpc.AgentManager, us *upload.Service, l *zap.Logger) *Handler {

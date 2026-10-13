@@ -245,6 +245,7 @@ func knownActions() []string {
 		store.AuditPolicyCreated, store.AuditPolicyUpdated, store.AuditPolicyDeleted,
 		store.AuditPolicySynced,
 		store.AuditInventoryReported,
+		store.AuditInventoryScanRequested,
 		store.AuditAgentRegistered, store.AuditAgentUpdated,
 		store.AuditAppPolicyViolation,
 		store.AuditAppAllowed, store.AuditAppBlocked, store.AuditAppElevated,
