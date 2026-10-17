@@ -508,7 +508,8 @@ func (s *AgentServer) Stream(stream agentv1.AgentService_StreamServer) error {
 				// Access events and agent-stats have their own handlers — don't dump the
 				// raw status JSON for them (agent stats especially would flood the log).
 				if statusVal != "__access_event__" && statusVal != "__agent_stats__" &&
-					statusVal != "__access_snapshot__" && statusVal != AppInventoryDiscriminator {
+					statusVal != "__access_snapshot__" && statusVal != AppInventoryDiscriminator &&
+					statusVal != EnforcementDiscriminator {
 					s.logger.Info("Agent status update",
 						zap.String("agent_id", agentID),
 						zap.String("status", statusVal),
@@ -537,6 +538,11 @@ func (s *AgentServer) Stream(stream agentv1.AgentService_StreamServer) error {
 				// policy is written against this.
 				if statusVal == AppInventoryDiscriminator {
 					go s.handleAppInventory(agentID, payload.Status.Message)
+				}
+				// What application control actually did on the machine. The
+				// only record of decisions made on the endpoint itself.
+				if statusVal == EnforcementDiscriminator {
+					go s.handleEnforcementReport(agentID, payload.Status.Message)
 				}
 			case *agentv1.AgentMessage_TerminalOutput:
 				// RDP tunnel sessions ("rdp_") carry port-forward data for the

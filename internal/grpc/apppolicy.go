@@ -21,16 +21,30 @@ type PolicyPusher struct {
 	store   store.Store
 	manager *AgentManager
 	logger  *zap.Logger
-
-	// enforcementEnabled mirrors the API's kill switch. It is passed to
-	// Resolve, which is where audit-versus-enforce is decided, so a machine
-	// cannot be sent an enforcing policy while the product says enforcement is
-	// off.
-	enforcementEnabled bool
 }
 
-func NewPolicyPusher(s store.Store, m *AgentManager, enforcementEnabled bool, logger *zap.Logger) *PolicyPusher {
-	return &PolicyPusher{store: s, manager: m, enforcementEnabled: enforcementEnabled, logger: logger}
+func NewPolicyPusher(s store.Store, m *AgentManager, logger *zap.Logger) *PolicyPusher {
+	return &PolicyPusher{store: s, manager: m, logger: logger}
+}
+
+// EnforcementEnabled reports whether a tenant has switched enforcement on.
+//
+// Read from the store on every resolution rather than cached: the switch is
+// the difference between a product that watches and one that closes somebody's
+// browser, and an operator turning it off expects that to take effect now, not
+// after the next restart.
+//
+// A read that fails returns false. The failure direction matters: an
+// unreachable settings document must mean "do not enforce", never "enforce
+// whatever the policies happen to say".
+func (p *PolicyPusher) EnforcementEnabled(tenantID string) bool {
+	settings, err := p.store.GetAppControlSettings(tenantID)
+	if err != nil || settings == nil {
+		p.logger.Warn("could not read application-control settings; treating enforcement as off",
+			zap.String("tenant_id", tenantID), zap.Error(err))
+		return false
+	}
+	return settings.Enforcement
 }
 
 // EffectiveFor resolves one machine's policy.
@@ -39,7 +53,7 @@ func (p *PolicyPusher) EffectiveFor(machine *store.Machine) (policy.Effective, e
 	if err != nil {
 		return policy.Effective{}, fmt.Errorf("loading policies: %w", err)
 	}
-	return policy.Resolve(machine, policies, p.enforcementEnabled), nil
+	return policy.Resolve(machine, policies, p.EnforcementEnabled(machine.TenantID)), nil
 }
 
 // PushTo delivers one machine's policy to it.
@@ -80,11 +94,21 @@ func (p *PolicyPusher) PushToTenant(tenantID string) (pushed int, failed int) {
 		return 0, 0
 	}
 
+	// Read once for the whole sweep. Per machine it would be one database
+	// round trip per endpoint, and worse, a switch flipped mid-sweep would
+	// leave half the fleet enforcing and half not.
+	enforcing := p.EnforcementEnabled(tenantID)
+	policies, err := p.store.GetAppPoliciesByTenant(tenantID)
+	if err != nil {
+		p.logger.Warn("policy push: could not load policies", zap.String("tenant_id", tenantID), zap.Error(err))
+		return 0, 0
+	}
+
 	for _, m := range machines {
 		if !p.manager.IsAgentConnected(m.AgentID) {
 			continue
 		}
-		if err := p.PushTo(m); err != nil {
+		if err := p.pushResolved(m, policies, enforcing); err != nil {
 			p.logger.Warn("policy push failed",
 				zap.String("agent_id", m.AgentID), zap.Error(err))
 			failed++
@@ -93,4 +117,19 @@ func (p *PolicyPusher) PushToTenant(tenantID string) (pushed int, failed int) {
 		pushed++
 	}
 	return pushed, failed
+}
+
+// pushResolved delivers a policy resolved from an already-loaded set.
+//
+// It exists so a fleet-wide push reads the policies and the enforcement switch
+// once rather than once per machine. PushTo remains the single-machine entry
+// point and goes through the same resolver, so the two cannot drift.
+func (p *PolicyPusher) pushResolved(machine *store.Machine, policies []*store.AppPolicy, enforcing bool) error {
+	eff := policy.Resolve(machine, policies, enforcing)
+
+	encoded, err := json.Marshal(eff)
+	if err != nil {
+		return fmt.Errorf("encoding the policy: %w", err)
+	}
+	return p.manager.SendAppPolicy(machine.AgentID, string(encoded))
 }

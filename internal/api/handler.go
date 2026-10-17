@@ -17,11 +17,11 @@ import (
 )
 
 type Handler struct {
-	store           store.Store
-	agentManager    *grpc.AgentManager
+	store        store.Store
+	agentManager *grpc.AgentManager
 	// policyPusher resolves and delivers application policy. Shared with the
 	// gRPC server so the save path and the connect path cannot disagree.
-	policyPusher *grpc.PolicyPusher
+	policyPusher    *grpc.PolicyPusher
 	terminalManager *TerminalManager
 	uploadService   *upload.Service
 	rdpManager      *RDPManager

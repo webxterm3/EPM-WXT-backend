@@ -87,9 +87,20 @@ func TestKnownActionsCoverTheWholeTaxonomy(t *testing.T) {
 // blocked" unless the report says the control does not exist — and that
 // difference is the whole value of the document.
 func TestReportNamesWhatIsNotRecorded(t *testing.T) {
-	gaps := notYetRecorded()
+	gaps := notYetRecorded(true)
 	if len(gaps) == 0 {
 		t.Fatal("the report claims to record everything")
+	}
+
+	// With enforcement off the report must say so outright, or its zero
+	// enforcement counts read as "nothing matched" rather than "nothing was
+	// ever going to be blocked".
+	off := strings.ToLower(strings.Join(notYetRecorded(false), " "))
+	if !strings.Contains(off, "audit mode") {
+		t.Error("with enforcement off, the report does not say the counts are zero by design")
+	}
+	if len(notYetRecorded(false)) <= len(gaps) {
+		t.Error("turning enforcement off did not add a caveat to the report")
 	}
 
 	joined := strings.ToLower(strings.Join(gaps, " "))

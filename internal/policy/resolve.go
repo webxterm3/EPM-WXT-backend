@@ -29,6 +29,12 @@ type EffectiveRule struct {
 	PolicyName string           `json:"policy_name"`
 	Scope      string           `json:"scope"`
 	Mode       string           `json:"mode"`
+
+	// RemoveBlocked carries the owning policy's choice about how hard a block
+	// should bite. It travels on the RULE because rules from several policies
+	// are flattened into one ordered list, and by the time the endpoint makes
+	// a decision there is no policy left to ask.
+	RemoveBlocked bool `json:"remove_blocked,omitempty"`
 }
 
 // Effective is everything that applies to one machine, in evaluation order.
@@ -36,8 +42,8 @@ type Effective struct {
 	AgentID  string `json:"agent_id"`
 	TenantID string `json:"tenant_id"`
 
-	// Mode is the strongest mode any contributing policy asked for. Phase A
-	// pins this to audit.
+	// Mode is the strongest mode any contributing policy asked for, or audit
+	// whenever the tenant's enforcement switch is off.
 	Mode string `json:"mode"`
 
 	DefaultAction string          `json:"default_action"`
@@ -181,16 +187,18 @@ func Resolve(machine *store.Machine, policies []*store.AppPolicy, enforcementEna
 			eff.Rules = append(eff.Rules, EffectiveRule{
 				Rule: rule, PolicyID: p.ID.Hex(), PolicyName: p.Name,
 				Scope: p.Scope.Kind, Mode: mode,
+				RemoveBlocked: p.RemoveBlocked,
 			})
 		}
 	}
 
 	eff.Conflicts = findConflicts(applicable)
 
-	// Phase A never enforces. The flag is read here, in one place, so that a
+	// The tenant's enforcement switch is read here, in one place, so that a
 	// bug anywhere else in the policy path still cannot block anybody's
-	// software — and so that turning enforcement on later is a single switch
-	// against machinery that has already been running.
+	// software. While it is off, every policy resolves to audit however its
+	// own Mode is set — and the endpoint is SENT audit, rather than being
+	// trusted to work that out for itself.
 	if enforcementEnabled {
 		eff.Mode = strongestMode(eff.Rules)
 	}

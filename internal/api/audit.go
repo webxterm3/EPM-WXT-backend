@@ -182,6 +182,16 @@ func (h *Handler) ComplianceReport(c *gin.Context) {
 	appPolicies, _ := h.store.GetAppPoliciesByTenant(tenantID)
 	accessPolicies, _ := h.store.GetRemoteAccessPoliciesByTenant(tenantID)
 
+	enforcing := h.enforcementEnabled(tenantID)
+	enforcement, err := h.store.CountEnforcementByMechanism(tenantID, q.From, q.To)
+	if err != nil {
+		// A report that silently shows zero blocks because a query failed is
+		// worse than one that is late: it reads as evidence that nothing was
+		// blocked.
+		h.logger.Warn("compliance report: enforcement activity unavailable", zap.Error(err))
+		enforcement = map[string]int64{}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"from":  q.From,
 		"to":    q.To,
@@ -199,25 +209,35 @@ func (h *Handler) ComplianceReport(c *gin.Context) {
 			counts[store.AuditPolicyUpdated] + counts[store.AuditPolicyDeleted],
 
 		"application_control": gin.H{
-			// Detected is a real figure today; the other three stay at zero
-			// until enforcement exists, and the gaps section says so.
+			// Violations are detections made from the inventory: software that
+			// a policy forbids was found installed. The enforcement figures
+			// below are a different thing entirely — they are decisions
+			// endpoints actually made — and they are counted separately
+			// because conflating them would let "we found it" read as "we
+			// stopped it".
 			"policy_violations_detected": counts[store.AuditAppPolicyViolation],
-			"blocked":                    counts[store.AuditAppBlocked],
-			"elevated":                   counts[store.AuditAppElevated],
-			"allowed":                    counts[store.AuditAppAllowed],
+
+			"programs_terminated":   enforcement[store.EnforceTerminate],
+			"launches_blocked":      enforcement[store.EnforceLock],
+			"applications_removed":  enforcement[store.EnforceQuarantine],
+			"applications_restored": enforcement[store.EnforceUnlock] + enforcement[store.EnforceRestore],
+			"policies_refused":      enforcement[store.EnforceRefused],
+
+			// Elevation is a separate control and is not built.
+			"elevated": counts[store.AuditAppElevated],
 		},
 
 		"policies": gin.H{
 			"application":    len(appPolicies),
 			"remote_access":  len(accessPolicies),
-			"enforcement_on": enforcementEnabled,
+			"enforcement_on": enforcing,
 		},
 
 		"inventory_coverage": coverage,
 
 		// Named gaps, returned by the server so the report cannot be rendered
 		// without them.
-		"not_yet_recorded": notYetRecorded(),
+		"not_yet_recorded": notYetRecorded(enforcing),
 	})
 }
 
@@ -228,14 +248,19 @@ func (h *Handler) ComplianceReport(c *gin.Context) {
 // indistinguishable from "nothing was blocked" unless the report says the
 // control does not exist — and that difference is the whole value of the
 // document.
-func notYetRecorded() []string {
-	return []string{
-		"Application allowed / blocked / elevated — nothing is prevented from running. Policy violations are DETECTED when software is installed and reported above, but execution is not intercepted, so no run-time decision exists to record.",
+func notYetRecorded(enforcing bool) []string {
+	gaps := []string{}
+	if !enforcing {
+		gaps = append(gaps,
+			"Application control is in AUDIT mode for this organisation — policies are evaluated and reported, and nothing is prevented from running. The enforcement figures above are therefore zero by design, not because nothing matched.")
+	}
+	return append(gaps,
+		"Application control does not intercept execution at the kernel. A launch is prevented by the operating system's own facilities (Image File Execution Options on Windows, withholding the execute bit on macOS) and a running program is terminated; both are reversible by a user who holds administrator rights on the machine. Where a policy asks for removal, the software is MOVED to an agent-controlled directory rather than deleted, and is restored if the policy changes or the agent is removed.",
 		"Sudo command activity — sudo management is not implemented.",
 		"Local administrator rights — least-privilege enforcement is not implemented.",
 		"Just-in-time approvals — the request model exists but the workflow is not switched on.",
 		"Portal sign-ins and user management are recorded separately by the authentication service and are not included here.",
-	}
+	)
 }
 
 // knownActions is the full taxonomy, ordered for a filter menu.

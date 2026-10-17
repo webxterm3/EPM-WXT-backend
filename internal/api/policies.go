@@ -16,21 +16,23 @@ import (
 	"github.com/vsay/vsay-agent-backend/internal/store"
 )
 
-// EnforcementEnabled is the global kill switch for application control.
+// enforcementEnabled reports whether a tenant has switched enforcement on.
 //
-// It is false for the whole of Phase A: policies are authored, delivered to
-// endpoints and simulated, and nothing is enforced. Keeping it as one named
-// constant read in one place means a bug anywhere else in the policy path
-// still cannot block somebody's software, and switching it on later is one
-// deliberate change rather than an archaeology exercise.
+// There is one source of truth for this — the tenant's settings document, read
+// through the shared policy pusher — and both the portal's answer and the mode
+// an endpoint is sent come from it. They used to come from a build-time
+// constant, which meant turning enforcement on was a deployment and turning it
+// off in a hurry was a deployment too.
 //
-// Exported because main.go hands it to the policy pusher: the agent is told
-// the mode along with the rules, so the machine that would do the blocking
-// reads the same switch as the portal that reports it.
-const EnforcementEnabled = false
-
-// enforcementEnabled is the unexported spelling used throughout this file.
-const enforcementEnabled = EnforcementEnabled
+// Everything fails closed: no pusher wired in, or a settings read that errors,
+// reports false. An unreachable switch must mean "do not act on anybody's
+// machine", never "act on whatever the policies happen to say".
+func (h *Handler) enforcementEnabled(tenantID string) bool {
+	if h.policyPusher == nil || tenantID == "" {
+		return false
+	}
+	return h.policyPusher.EnforcementEnabled(tenantID)
+}
 
 // simulationTimeout bounds one projection. A tenant with a very large fleet
 // should get a clear failure rather than a request that hangs.
@@ -52,9 +54,9 @@ func (h *Handler) ListAppPolicies(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"policies": policies,
-		// Said out loud on every read so the UI never has to assume: in
-		// Phase A these are authored and projected, never applied.
-		"enforcement_enabled": enforcementEnabled,
+		// Said out loud on every read so the UI never has to assume whether
+		// these are being applied or only projected.
+		"enforcement_enabled": h.enforcementEnabled(tenantID),
 	})
 }
 
@@ -263,6 +265,11 @@ func (h *Handler) SimulateAppPolicy(c *gin.Context) {
 		return
 	}
 
+	// Resolved against the tenant's real switch, so the projection says what
+	// saving this would actually do rather than what it would do in some other
+	// configuration.
+	enforcing := h.enforcementEnabled(tenantID)
+
 	sim := &policy.Simulator{
 		Effective: make(map[string]policy.Effective, len(machines)),
 		Machines:  make(map[string]*store.Machine, len(machines)),
@@ -271,7 +278,7 @@ func (h *Handler) SimulateAppPolicy(c *gin.Context) {
 		if m.AgentID == "" || m.Revoked {
 			continue
 		}
-		sim.Effective[m.AgentID] = policy.Resolve(m, combined, enforcementEnabled)
+		sim.Effective[m.AgentID] = policy.Resolve(m, combined, enforcing)
 		sim.Machines[m.AgentID] = m
 	}
 
@@ -294,7 +301,7 @@ func (h *Handler) SimulateAppPolicy(c *gin.Context) {
 		// Coverage travels with the result because the headline counts are
 		// only honest next to how much of the fleet they are drawn from.
 		"coverage":            coverage,
-		"enforcement_enabled": enforcementEnabled,
+		"enforcement_enabled": enforcing,
 	})
 }
 
@@ -346,6 +353,14 @@ func preparePolicy(p store.AppPolicy, tenantID, actor string) (*store.AppPolicy,
 	if p.Mode != store.ModeEnforce {
 		p.Mode = store.ModeAudit
 	}
+	// Removal only means anything for a policy that blocks something, and a
+	// default-deny policy must not be able to reach it: the rules in such a
+	// policy are the ALLOW list, so nothing a rule matched is blocked, and
+	// everything else would be swept off the machine by the catch-all.
+	if p.DefaultAction == store.ActionBlock {
+		p.RemoveBlocked = false
+	}
+
 	if p.DefaultAction != store.ActionBlock {
 		// Anything other than an explicit block defaults to allow. A policy
 		// that defaults to block the moment it is saved would take a fleet out.
@@ -381,3 +396,123 @@ func preparePolicy(p store.AppPolicy, tenantID, actor string) (*store.AppPolicy,
 type errBadPolicy string
 
 func (e errBadPolicy) Error() string { return string(e) }
+
+// GetAppControlSettings handles GET /api/app-control/settings.
+func (h *Handler) GetAppControlSettings(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id not found in context"})
+		return
+	}
+
+	settings, err := h.store.GetAppControlSettings(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load settings"})
+		return
+	}
+	c.JSON(http.StatusOK, settings)
+}
+
+// SetAppControlEnforcement handles PUT /api/app-control/settings.
+//
+// This is the switch between a product that watches and one that closes
+// somebody's browser, so it is deliberately its own endpoint rather than a
+// field on a policy: turning it on is one decision, made once, recorded in the
+// audit trail with a name against it, and not something that can ride along
+// unnoticed with an ordinary policy edit.
+func (h *Handler) SetAppControlEnforcement(c *gin.Context) {
+	tenantID, ok := h.requirePolicyAdmin(c)
+	if !ok {
+		return
+	}
+
+	var body struct {
+		// A pointer so that an omitted field is rejected rather than read as
+		// false. "Turn enforcement off" and "I forgot to send the field" must
+		// not be the same request.
+		Enforcement *bool `json:"enforcement"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Enforcement == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "enforcement must be true or false"})
+		return
+	}
+
+	actor := c.GetString("username")
+	if err := h.store.SetAppControlEnforcement(tenantID, *body.Enforcement, actor); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save settings"})
+		return
+	}
+
+	h.record(c, auditEntry{
+		Action: store.AuditPolicyUpdated, Resource: "application_control",
+		ResourceID: tenantID,
+		Details: map[string]any{
+			"setting": "enforcement", "enabled": *body.Enforcement,
+		},
+	})
+	// Info, not Warn.
+	//
+	// Somebody deliberately flipping a switch is not a warning, and this
+	// logger attaches a stack trace to everything at Warn and above — so every
+	// time an operator turned enforcement on or off the server log grew a
+	// twenty-line stack that reads exactly like a crash. It was reported as
+	// one. The audit entry above is the record that matters; this line is for
+	// whoever is tailing the log.
+	h.logger.Info("application-control enforcement changed",
+		zap.String("tenant_id", tenantID), zap.String("actor", actor),
+		zap.Bool("enforcement", *body.Enforcement))
+
+	// Pushed immediately. The switch only means anything once the endpoints
+	// have been told, and an operator who has just turned enforcement off is
+	// very likely doing it because something is going wrong right now.
+	h.pushPolicyToFleet(c)
+
+	c.JSON(http.StatusOK, gin.H{
+		"enforcement": *body.Enforcement,
+		"message":     enforcementMessage(*body.Enforcement),
+	})
+}
+
+func enforcementMessage(on bool) string {
+	if on {
+		return "Enforcement is on. Policies set to enforce will now block software on your machines."
+	}
+	return "Enforcement is off. Policies are evaluated and reported, and nothing is blocked."
+}
+
+// ListEnforcementEvents handles GET /api/app-control/events.
+//
+// This is the answer to "why did my application stop working", and the only
+// one there is: the decision was made on an endpoint, by a process nobody was
+// watching, possibly while the machine was offline.
+func (h *Handler) ListEnforcementEvents(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id not found in context"})
+		return
+	}
+
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+
+	events, total, err := h.store.GetEnforcementEvents(
+		tenantID, strings.TrimSpace(c.Query("agent_id")), limit, (page-1)*limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load enforcement activity"})
+		return
+	}
+	if events == nil {
+		events = []*store.EnforcementEvent{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"events": events, "total": total, "page": page, "limit": limit,
+		"enforcement_enabled": h.enforcementEnabled(tenantID),
+	})
+}

@@ -219,9 +219,10 @@ type InventoryCoverage struct {
 
 // Application-control policy.
 //
-// Phase A stores and simulates these; nothing is enforced on any endpoint.
-// The shape is built for enforcement anyway, so that turning it on later is a
-// mode flip on an object people already understand rather than a new concept.
+// A policy is authored, simulated against the fleet's real inventory, and then
+// enforced — or not. Whether any of it acts on an endpoint is one switch per
+// tenant, AppControlSettings.Enforcement, and not a property of the policy
+// itself: that way "what would this do" and "do it" stay separate decisions.
 
 // Policy actions.
 const (
@@ -238,7 +239,8 @@ const (
 const (
 	// ModeAudit records what would have happened and changes nothing.
 	ModeAudit = "audit"
-	// ModeEnforce acts on the decision. Phase A never resolves to this.
+	// ModeEnforce acts on the decision. Only reached when the tenant's
+	// AppControlSettings.Enforcement is on.
 	ModeEnforce = "enforce"
 )
 
@@ -267,6 +269,90 @@ const (
 	OpWildcard = "wildcard"
 )
 
+// AppControlSettings is a tenant's application-control configuration.
+//
+// Today it holds one thing, and that one thing is the switch between a product
+// that watches and a product that acts on somebody's laptop. It is a stored
+// per-tenant setting rather than a build-time constant because turning
+// enforcement on is a decision an organisation makes for itself, after reading
+// a simulation, and should not require a deployment.
+type AppControlSettings struct {
+	ID       primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	TenantID string             `bson:"tenant_id" json:"tenant_id"`
+
+	// Enforcement is the master switch. While it is false every policy
+	// resolves to audit mode however its own Mode is set, so no endpoint acts
+	// on anything. The default — for a tenant that has never chosen, and for a
+	// settings document that fails to read — is false.
+	Enforcement bool `bson:"enforcement" json:"enforcement"`
+
+	UpdatedAt time.Time `bson:"updated_at,omitempty" json:"updated_at,omitempty"`
+	UpdatedBy string    `bson:"updated_by,omitempty" json:"updated_by,omitempty"`
+}
+
+// Enforcement mechanisms, as reported by an agent.
+const (
+	// EnforceTerminate: a running program was closed.
+	EnforceTerminate = "terminate"
+	// EnforceLock: an application was prevented from launching.
+	EnforceLock = "launch-lock"
+	// EnforceUnlock: an application that is no longer blocked was restored.
+	EnforceUnlock = "launch-unlock"
+	// EnforceRefused: the agent declined to apply a policy, because doing so
+	// would have blocked an implausible number of applications at once.
+	EnforceRefused = "refused"
+	// EnforceQuarantine: the application was moved off the machine, into a
+	// directory only the agent writes to. A move, never a delete.
+	EnforceQuarantine = "quarantine"
+	// EnforceRestore: a quarantined application was put back where it was.
+	EnforceRestore = "restore"
+)
+
+// EnforcementEvent is one thing an agent did, or declined to do, to the
+// software on a machine.
+//
+// This is the answer to "why did my application stop working", and it is the
+// only answer there is: the decision was made on the endpoint, in a process
+// nobody was watching, possibly while the machine was offline. Machine and
+// tenant are denormalised onto every row so that reading a fleet-wide history
+// never needs a join.
+type EnforcementEvent struct {
+	ID       primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	TenantID string             `bson:"tenant_id" json:"tenant_id"`
+	AgentID  string             `bson:"agent_id" json:"agent_id"`
+
+	MachineID   primitive.ObjectID `bson:"machine_id,omitempty" json:"machine_id,omitempty"`
+	MachineName string             `bson:"machine_name,omitempty" json:"machine_name,omitempty"`
+
+	// At is when it happened on the endpoint; CreatedAt is when it reached
+	// here. They differ by however long the machine was offline, and the gap
+	// is itself worth seeing.
+	At        time.Time `bson:"at" json:"at"`
+	CreatedAt time.Time `bson:"created_at" json:"created_at"`
+
+	Mechanism string `bson:"mechanism" json:"mechanism"`
+	Outcome   string `bson:"outcome" json:"outcome"`
+
+	AppName  string `bson:"app_name,omitempty" json:"app_name,omitempty"`
+	Path     string `bson:"path,omitempty" json:"path,omitempty"`
+	BundleID string `bson:"bundle_id,omitempty" json:"bundle_id,omitempty"`
+
+	// Rule and Policy name what decided. Both empty means the policy default
+	// applied rather than any rule, which is a different conversation to have
+	// with the person whose software stopped.
+	Rule   string `bson:"rule,omitempty" json:"rule,omitempty"`
+	Policy string `bson:"policy,omitempty" json:"policy,omitempty"`
+
+	PID int `bson:"pid,omitempty" json:"pid,omitempty"`
+
+	// Detail carries the reason for a failure or a refusal.
+	Detail string `bson:"detail,omitempty" json:"detail,omitempty"`
+
+	// How the endpoint prevents launches, which differs by platform and is
+	// what an operator needs in order to know how strong the block is.
+	EnforcedBy string `bson:"enforced_by,omitempty" json:"enforced_by,omitempty"`
+}
+
 // AppPolicy is one named set of ordered rules applying to some machines.
 //
 // One document per policy with an ordered rule list, rather than a document
@@ -282,8 +368,9 @@ type AppPolicy struct {
 
 	Scope PolicyScope `bson:"scope" json:"scope"`
 
-	// Mode is audit or enforce. In Phase A the resolver forces audit
-	// regardless, so a bug here cannot block anybody's software.
+	// Mode is audit or enforce. A policy asking to enforce only does so once
+	// the tenant's enforcement switch is on: the resolver forces audit
+	// otherwise, so a policy saved as enforce cannot act by itself.
 	Mode string `bson:"mode" json:"mode"`
 
 	// Priority breaks ties between policies at the same scope. Higher wins.
@@ -291,6 +378,20 @@ type AppPolicy struct {
 
 	// DefaultAction applies when no rule matches.
 	DefaultAction string `bson:"default_action" json:"default_action"`
+
+	// RemoveBlocked makes a block bite harder: instead of only being stopped
+	// from launching, matching software is MOVED off the machine into a
+	// directory only the agent writes to.
+	//
+	// A move, never a delete, and the agent puts it back when the policy stops
+	// blocking it or when the agent is uninstalled. That is what makes this
+	// safe enough to offer at all — a rule aimed at the wrong application is
+	// recoverable from a move and is not recoverable from a delete.
+	//
+	// It applies only to software a RULE matched. The policy's own catch-all
+	// cannot reach it, because a default that swept an entire Applications
+	// folder into quarantine is not something anybody means to express.
+	RemoveBlocked bool `bson:"remove_blocked,omitempty" json:"remove_blocked,omitempty"`
 
 	Rules []PolicyRule `bson:"rules" json:"rules"`
 
@@ -912,6 +1013,13 @@ type Store interface {
 	GetInventoryCoverage(tenantID string, staleAfter time.Duration) (InventoryCoverage, error)
 
 	// Application-control policies.
+	GetAppControlSettings(tenantID string) (*AppControlSettings, error)
+	SetAppControlEnforcement(tenantID string, enabled bool, actor string) error
+	RecordEnforcementEvents(events []EnforcementEvent) error
+	GetEnforcementEvents(tenantID, agentID string, limit, skip int) ([]*EnforcementEvent, int64, error)
+	CountEnforcementByMechanism(tenantID string, from, to time.Time) (map[string]int64, error)
+	DeleteEnforcementEventsByMachine(machineID primitive.ObjectID) error
+
 	CreateAppPolicy(p *AppPolicy) error
 	UpdateAppPolicy(p *AppPolicy) error
 	DeleteAppPolicy(tenantID string, id primitive.ObjectID) error

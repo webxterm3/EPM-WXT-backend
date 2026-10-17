@@ -74,11 +74,39 @@ func TestDefaultsAreSafe(t *testing.T) {
 	}
 }
 
-// The global switch is what stands between a policy bug and somebody's laptop
-// for the whole of Phase A.
-func TestEnforcementIsOffInThisPhase(t *testing.T) {
-	if enforcementEnabled {
-		t.Fatal("enforcement is enabled — Phase A must not act on any endpoint")
+// Enforcement is what stands between a policy bug and somebody's laptop, so
+// every way of failing to find out whether it is on has to answer "off".
+//
+// The dangerous direction is only one of them: reporting enforcement as on
+// when it is off is a cosmetic bug in the portal, while reporting it as off —
+// or resolving it as off — when it should be on is a policy nobody is
+// enforcing. But a handler with nothing wired in must not reach for a default
+// of true, and this pins that.
+func TestEnforcementFailsClosed(t *testing.T) {
+	// No pusher: the server is half-built, or this is a code path that was
+	// never given one.
+	h := &Handler{}
+	if h.enforcementEnabled("t1") {
+		t.Error("a handler with no policy pusher reported enforcement as on")
+	}
+	// No tenant on the request.
+	if h.enforcementEnabled("") {
+		t.Error("a request with no tenant reported enforcement as on")
+	}
+}
+
+// A policy may ask to enforce; whether it does is the tenant's switch.
+//
+// preparePolicy must keep accepting enforce as a stored mode — the resolver is
+// what gates it — or turning the tenant switch on would find every policy
+// permanently pinned to audit.
+func TestAPolicyMayAskToEnforce(t *testing.T) {
+	p, err := preparePolicy(draft(func(p *store.AppPolicy) { p.Mode = store.ModeEnforce }), "t1", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Mode != store.ModeEnforce {
+		t.Errorf("Mode = %q, want enforce to be preserved", p.Mode)
 	}
 }
 

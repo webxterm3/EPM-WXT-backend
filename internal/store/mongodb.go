@@ -29,6 +29,8 @@ type MongoDB struct {
 	InstalledApps        *mongo.Collection
 	InventoryScans       *mongo.Collection
 	AppPolicies          *mongo.Collection
+	AppControlSettings   *mongo.Collection
+	EnforcementEvents    *mongo.Collection
 	RemoteAccessPolicies *mongo.Collection
 }
 
@@ -64,6 +66,8 @@ func NewMongoDB(uri, dbName string) (*MongoDB, error) {
 		InstalledApps:        db.Collection("installed_apps"),
 		InventoryScans:       db.Collection("inventory_scans"),
 		AppPolicies:          db.Collection("app_policies"),
+		AppControlSettings:   db.Collection("app_control_settings"),
+		EnforcementEvents:    db.Collection("enforcement_events"),
 		RemoteAccessPolicies: db.Collection("remote_access_policies"),
 	}
 
@@ -112,6 +116,32 @@ func (m *MongoDB) ensureIndexes(ctx context.Context) error {
 		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "present", Value: 1}, {Key: "name_lower", Value: 1}}},
 		{Keys: bson.D{{Key: "machine_id", Value: 1}, {Key: "present", Value: 1}}},
 		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "removed_at", Value: -1}}, Options: options.Index().SetSparse(true)},
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = m.AppControlSettings.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		// One settings document per tenant. Unique rather than merely indexed
+		// because two documents would mean enforcement being on or off
+		// depending on which one a query happened to read first.
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}}, Options: options.Index().SetUnique(true)},
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = m.EnforcementEvents.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "at", Value: -1}}},
+		{Keys: bson.D{{Key: "agent_id", Value: 1}, {Key: "at", Value: -1}}},
+		{Keys: bson.D{{Key: "machine_id", Value: 1}}},
+		// Enforcement history ages out on its own. These are high-volume
+		// operational records — one per blocked application per five minutes
+		// per machine — and without a ceiling the collection only ever grows.
+		// A year is long enough to answer "what did we block last quarter",
+		// which is the question anybody actually asks of it.
+		{Keys: bson.D{{Key: "created_at", Value: 1}},
+			Options: options.Index().SetExpireAfterSeconds(int32(365 * 24 * 3600))},
 	})
 	if err != nil {
 		return err
@@ -880,6 +910,7 @@ func (m *MongoDB) DeleteMachine(machineID primitive.ObjectID) error {
 	byMachine := bson.M{"machine_id": machineID}
 	for _, c := range []*mongo.Collection{
 		m.Logs, m.Sessions, m.Recordings, m.AccessEvents, m.AccessRequests, m.InstalledApps,
+		m.EnforcementEvents,
 	} {
 		if _, err := c.DeleteMany(ctx, byMachine); err != nil {
 			return err

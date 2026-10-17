@@ -174,9 +174,10 @@ func main() {
 	// HTTP Handler (create early to wire terminal manager)
 	// Auth is now handled by vsay-auth gateway, no local auth service needed
 	// One pusher, shared by the API layer (on save) and the gRPC server (on
-	// connect). Built from api.EnforcementEnabled so a machine can never be
-	// sent an enforcing policy while the product reports enforcement as off.
-	policyPusher := grpc.NewPolicyPusher(st, agentManager, api.EnforcementEnabled, logger)
+	// connect). It reads each tenant's enforcement switch from the store on
+	// every resolution, so a machine can never be sent an enforcing policy
+	// while the portal reports enforcement as off for that tenant.
+	policyPusher := grpc.NewPolicyPusher(st, agentManager, logger)
 
 	h := api.NewHandler(st, agentManager, uploadService, logger)
 	h.SetPolicyPusher(policyPusher)
@@ -493,6 +494,11 @@ func main() {
 		auth.GET("/app-policies/:id", h.GetAppPolicy)
 		auth.PUT("/app-policies/:id", h.UpdateAppPolicy)
 		auth.DELETE("/app-policies/:id", h.DeleteAppPolicy)
+
+		// The enforcement switch and the record of what endpoints did with it.
+		auth.GET("/app-control/settings", h.GetAppControlSettings)
+		auth.PUT("/app-control/settings", h.SetAppControlEnforcement)
+		auth.GET("/app-control/events", h.ListEnforcementEvents)
 
 		// Remote-access policies: who may connect to which machines, by what
 		// means, when, and under what conditions.

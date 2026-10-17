@@ -87,7 +87,7 @@ cp -R "$WORK/wxt-agent.app" "$APP_DIR"
 # The agent binary also goes in PATH so `wxt-agent …` works in a terminal. The
 # session helper deliberately does NOT: it runs from inside the bundle, which
 # is what gives the product one row in System Settings rather than two.
-cp "$APP_DIR/Contents/Resources/wxt-agent" "$INSTALL_DIR/wxt-agent"
+cp "$APP_DIR/Contents/MacOS/wxt-agent" "$INSTALL_DIR/wxt-agent"
 chmod 755 "$INSTALL_DIR/wxt-agent"
 rm -f "$INSTALL_DIR/wxt-agent-session"
 

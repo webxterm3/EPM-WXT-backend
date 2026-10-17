@@ -53,7 +53,11 @@ func (m *MongoDB) UpdateAppPolicy(p *AppPolicy) error {
 			"name": p.Name, "description": p.Description, "enabled": p.Enabled,
 			"scope": p.Scope, "mode": p.Mode, "priority": p.Priority,
 			"default_action": p.DefaultAction, "rules": p.Rules,
-			"updated_at": p.UpdatedAt, "updated_by": p.UpdatedBy,
+			// Spelled out like every other field: this $set names its fields
+			// explicitly, so a new one that is not listed here is accepted by
+			// the API, stored on create, and silently dropped on every edit.
+			"remove_blocked": p.RemoveBlocked,
+			"updated_at":     p.UpdatedAt, "updated_by": p.UpdatedBy,
 		}})
 	if err != nil {
 		if mongo.IsDuplicateKeyError(err) {
