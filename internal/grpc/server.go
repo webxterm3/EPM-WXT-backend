@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vsay/vsay-agent-backend/internal/email"
@@ -32,6 +33,13 @@ type AgentServer struct {
 	// policyPusher is shared with the API layer, so the on-connect push and
 	// the admin-save push resolve a machine's policy the same way.
 	policyPusher *PolicyPusher
+
+	// policyReqAt rate-limits agent-initiated policy requests, per machine.
+	// The map is small — one entry per machine that has ever pressed the
+	// button — and never pruned, which is the right trade for a fleet whose
+	// size is bounded by the machines that exist.
+	policyReqMu sync.Mutex
+	policyReqAt map[string]time.Time
 }
 
 // SetPolicyPusher wires in the shared resolver/pusher.
@@ -543,6 +551,12 @@ func (s *AgentServer) Stream(stream agentv1.AgentService_StreamServer) error {
 				// only record of decisions made on the endpoint itself.
 				if statusVal == EnforcementDiscriminator {
 					go s.handleEnforcementReport(agentID, payload.Status.Message)
+				}
+				// Somebody pressed "Sync Now" in the menu bar. The request
+				// carries nothing but the agent's identity — what it is
+				// entitled to is decided here, from the machine record.
+				if statusVal == PolicyRequestDiscriminator {
+					go s.handlePolicyRequest(agentID)
 				}
 			case *agentv1.AgentMessage_TerminalOutput:
 				// RDP tunnel sessions ("rdp_") carry port-forward data for the

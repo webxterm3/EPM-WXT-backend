@@ -92,7 +92,15 @@ chmod 755 "$INSTALL_DIR/wxt-agent"
 rm -f "$INSTALL_DIR/wxt-agent-session"
 
 echo "Enrolling…"
-"$INSTALL_DIR/wxt-agent" configure "$@"
+# stdin is closed for this call on purpose.
+#
+# This script is normally run as `curl … | sudo bash -s -- …`, which means
+# bash is READING THE SCRIPT ITSELF from stdin. A child that reads stdin would
+# swallow the rest of the script, and the install would stop halfway through
+# with no error — the classic curl-pipe-to-shell trap. configure does not
+# prompt today; this makes sure that staying true is not a condition of the
+# installer working.
+"$INSTALL_DIR/wxt-agent" configure "$@" < /dev/null
 
 cat <<'NOTE'
 

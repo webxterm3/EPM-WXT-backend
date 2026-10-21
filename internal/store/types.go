@@ -306,6 +306,34 @@ const (
 	EnforceQuarantine = "quarantine"
 	// EnforceRestore: a quarantined application was put back where it was.
 	EnforceRestore = "restore"
+	// EnforceElevate: an application was granted the right to run with
+	// administrator rights. The only mechanism here that GIVES privilege
+	// rather than taking it away, which is why it is counted separately and
+	// reported separately.
+	EnforceElevate = "elevate"
+	// EnforceElevateRevoked: that grant was withdrawn.
+	EnforceElevateRevoked = "elevate-revoked"
+	// The outcome of one enforcement action, as the agent reports it.
+	//
+	// These were previously compared as bare strings wherever the backend
+	// needed them, with the only definition living in the agent. The agent
+	// renaming one would not break a build here — it would quietly stop
+	// matching, and whatever the backend does for a failure would simply stop
+	// happening. Pinned against the agent's source by the drift test.
+
+	// OutcomeApplied: the agent did the thing.
+	OutcomeApplied = "applied"
+	// OutcomeFailed: the agent tried and could not. For elevation this is the
+	// normal outcome today, because no platform implements it.
+	OutcomeFailed = "failed"
+	// OutcomeSkipped: the agent deliberately did nothing, for example in audit
+	// mode or where a safety rule refused.
+	OutcomeSkipped = "skipped"
+
+	// EnforceElevateLaunch: an application actually RAN elevated. The others
+	// describe configuration; this one describes something that happened, and
+	// it is the line an auditor asks for.
+	EnforceElevateLaunch = "elevate-launch"
 )
 
 // EnforcementEvent is one thing an agent did, or declined to do, to the
@@ -316,6 +344,63 @@ const (
 // nobody was watching, possibly while the machine was offline. Machine and
 // tenant are denormalised onto every row so that reading a fleet-wide history
 // never needs a join.
+// EnforcementCount identifies one bucket of enforcement activity.
+//
+// Mechanism alone is not an answer. "elevate" counts an endpoint being ASKED
+// to elevate; whether it did is the outcome, and the two were conflated in the
+// compliance report until this type existed — reporting every refusal as a
+// privilege granted.
+type EnforcementCount struct {
+	Mechanism string `bson:"mechanism"`
+	Outcome   string `bson:"outcome"`
+}
+
+// Applied totals one mechanism's successes, which is what a report means when
+// it says something was done.
+func Applied(counts map[EnforcementCount]int64, mechanisms ...string) int64 {
+	var n int64
+	for _, mech := range mechanisms {
+		n += counts[EnforcementCount{Mechanism: mech, Outcome: OutcomeApplied}]
+	}
+	return n
+}
+
+// NotApplied totals the times a mechanism was asked for and did not happen —
+// the figure that says a policy is not being honoured.
+func NotApplied(counts map[EnforcementCount]int64, mechanisms ...string) int64 {
+	var n int64
+	for key, c := range counts {
+		for _, mech := range mechanisms {
+			if key.Mechanism == mech && key.Outcome != OutcomeApplied {
+				n += c
+			}
+		}
+	}
+	return n
+}
+
+// EnforcementEventQuery narrows a listing of enforcement activity.
+//
+// A struct rather than six positional arguments, three of which are strings:
+// GetEnforcementEvents(tenant, agent, search, …) is a call where transposing
+// two of them compiles, runs, and quietly returns the wrong tenant's history.
+type EnforcementEventQuery struct {
+	TenantID string
+	// AgentID narrows to one machine; empty means the whole fleet.
+	AgentID string
+
+	// Search is matched against the application, where it lives, and the rule
+	// or policy that decided — the four things somebody has in hand when they
+	// ask why their software stopped. It is LITERAL text: whatever is typed is
+	// escaped before it reaches the database, so a path containing "." or
+	// "C:\Program Files (x86)" searches for itself rather than being read as
+	// a pattern that matches everything or fails outright.
+	Search string
+
+	Limit int
+	Skip  int
+}
+
 type EnforcementEvent struct {
 	ID       primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	TenantID string             `bson:"tenant_id" json:"tenant_id"`
@@ -1016,8 +1101,12 @@ type Store interface {
 	GetAppControlSettings(tenantID string) (*AppControlSettings, error)
 	SetAppControlEnforcement(tenantID string, enabled bool, actor string) error
 	RecordEnforcementEvents(events []EnforcementEvent) error
-	GetEnforcementEvents(tenantID, agentID string, limit, skip int) ([]*EnforcementEvent, int64, error)
-	CountEnforcementByMechanism(tenantID string, from, to time.Time) (map[string]int64, error)
+	GetEnforcementEvents(q EnforcementEventQuery) ([]*EnforcementEvent, int64, error)
+
+	// ClaimNotification reserves the right to send one notification, so a
+	// standing condition reported every few minutes is mailed once.
+	ClaimNotification(key string, cooldown time.Duration) (bool, error)
+	CountEnforcementByMechanism(tenantID string, from, to time.Time) (map[EnforcementCount]int64, error)
 	DeleteEnforcementEventsByMachine(machineID primitive.ObjectID) error
 
 	CreateAppPolicy(p *AppPolicy) error

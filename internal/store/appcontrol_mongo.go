@@ -2,10 +2,13 @@ package store
 
 import (
 	"context"
+	"regexp"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
@@ -84,17 +87,50 @@ func (m *MongoDB) RecordEnforcementEvents(events []EnforcementEvent) error {
 	return err
 }
 
-// GetEnforcementEvents returns a tenant's enforcement activity, newest first.
+// enforcementEventFilter builds the query for one listing.
 //
-// agentID narrows it to one machine; empty means the whole fleet.
-func (m *MongoDB) GetEnforcementEvents(tenantID, agentID string, limit, skip int) ([]*EnforcementEvent, int64, error) {
+// Separated from the database call so it can be tested on its own: the
+// interesting mistakes here — dropping the tenant scope, letting typed text
+// reach the engine as a pattern, searching the wrong fields — are all
+// mistakes in this value, and none of them need a database to catch.
+func enforcementEventFilter(q EnforcementEventQuery) bson.M {
+	filter := bson.M{"tenant_id": q.TenantID}
+	if q.AgentID != "" {
+		filter["agent_id"] = q.AgentID
+	}
+
+	search := strings.TrimSpace(q.Search)
+	if search == "" {
+		return filter
+	}
+
+	// QuoteMeta, always. Enforcement activity is mostly file paths, and paths
+	// are full of regex metacharacters: "C:\Program Files (x86)\…" is an
+	// unbalanced group that makes the whole query error, and a lone "." from
+	// somebody typing an extension matches every row in the tenant. Escaped,
+	// each one searches for itself.
+	re := primitive.Regex{Pattern: regexp.QuoteMeta(search), Options: "i"}
+
+	// $or sits beside the tenant scope, not instead of it: the whole filter is
+	// an AND, so a search can only ever narrow what this tenant may already
+	// see. It can never reach another tenant's history.
+	filter["$or"] = []bson.M{
+		{"app_name": re},
+		{"path": re},
+		{"rule": re},
+		{"policy": re},
+		{"machine_name": re},
+	}
+	return filter
+}
+
+// GetEnforcementEvents returns a tenant's enforcement activity, newest first.
+func (m *MongoDB) GetEnforcementEvents(q EnforcementEventQuery) ([]*EnforcementEvent, int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	filter := bson.M{"tenant_id": tenantID}
-	if agentID != "" {
-		filter["agent_id"] = agentID
-	}
+	filter := enforcementEventFilter(q)
+	limit, skip := q.Limit, q.Skip
 
 	total, err := m.EnforcementEvents.CountDocuments(ctx, filter)
 	if err != nil {
@@ -137,25 +173,38 @@ func (m *MongoDB) DeleteEnforcementEventsByMachine(machineID primitive.ObjectID)
 // decisions were made on endpoints: the audit log records what administrators
 // did in the portal, and no administrator is present when a machine closes a
 // blocked program at two in the morning.
-func (m *MongoDB) CountEnforcementByMechanism(tenantID string, from, to time.Time) (map[string]int64, error) {
+func (m *MongoDB) CountEnforcementByMechanism(tenantID string, from, to time.Time) (map[EnforcementCount]int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	match := bson.M{"tenant_id": tenantID, "at": bson.M{"$gte": from, "$lte": to}}
+	// Grouped by outcome as well as mechanism.
+	//
+	// It used to group on mechanism alone, which meant the compliance report's
+	// "elevation_grants" counted every elevate event whatever became of it.
+	// Elevation is not implemented on any platform, so every one of those
+	// events is a FAILURE — the endpoint saying it cannot honour the rule —
+	// and the report therefore stated a count of privileges handed out that
+	// was climbing every few minutes while the true figure was zero. A
+	// compliance report asserting the opposite of the truth about privilege
+	// grants is worse than no report.
 	cur, err := m.EnforcementEvents.Aggregate(ctx, []bson.M{
 		{"$match": match},
-		{"$group": bson.M{"_id": "$mechanism", "count": bson.M{"$sum": 1}}},
+		{"$group": bson.M{
+			"_id":   bson.M{"mechanism": "$mechanism", "outcome": "$outcome"},
+			"count": bson.M{"$sum": 1},
+		}},
 	})
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = cur.Close(ctx) }()
 
-	out := map[string]int64{}
+	out := map[EnforcementCount]int64{}
 	for cur.Next(ctx) {
 		var row struct {
-			ID    string `bson:"_id"`
-			Count int64  `bson:"count"`
+			ID    EnforcementCount `bson:"_id"`
+			Count int64            `bson:"count"`
 		}
 		if err := cur.Decode(&row); err != nil {
 			continue
@@ -163,4 +212,56 @@ func (m *MongoDB) CountEnforcementByMechanism(tenantID string, from, to time.Tim
 		out[row.ID] = row.Count
 	}
 	return out, cur.Err()
+}
+
+// ClaimNotification reserves the right to send one notification for key, and
+// reports whether this caller won it.
+//
+// The claim is the INSERT. A unique _id makes it atomic, so two backends — or
+// two reports from the same machine arriving together — cannot both be told to
+// send. Whoever loses gets a duplicate-key error and stays quiet.
+//
+// Failing OPEN is deliberate. If the database cannot be reached, the caller is
+// told to send: a duplicate alert is an annoyance, a missed one about
+// administrator rights being granted is the thing this exists to report. The
+// error is returned as well so the caller can log it.
+func (m *MongoDB) ClaimNotification(key string, cooldown time.Duration) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := m.NotificationClaims.InsertOne(ctx, bson.M{
+		"_id":        key,
+		"claimed_at": time.Now(),
+		"expires_at": time.Now().Add(cooldown),
+	})
+	if err == nil {
+		return true, nil
+	}
+	if mongo.IsDuplicateKeyError(err) {
+		return false, nil
+	}
+	return true, err
+}
+
+// NotificationKey builds the identity of a notification for deduplication.
+//
+// Every part that distinguishes one alert from another belongs in it, and
+// nothing else does. Including a timestamp or an event id would make every
+// claim unique and silently disable the suppression; leaving out the
+// application would collapse a whole machine's alerts into one and hide all
+// but the first.
+func NotificationKey(parts ...string) string {
+	cleaned := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			p = "-"
+		}
+		// The separator must not be forgeable from a part, or two different
+		// alerts could claim the same key: an application literally named
+		// "a|b" would otherwise collide with machine "a" plus application "b".
+		p = strings.ReplaceAll(p, "|", "/")
+		cleaned = append(cleaned, p)
+	}
+	return strings.Join(cleaned, "|")
 }

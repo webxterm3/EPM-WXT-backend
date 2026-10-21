@@ -189,7 +189,7 @@ func (h *Handler) ComplianceReport(c *gin.Context) {
 		// worse than one that is late: it reads as evidence that nothing was
 		// blocked.
 		h.logger.Warn("compliance report: enforcement activity unavailable", zap.Error(err))
-		enforcement = map[string]int64{}
+		enforcement = map[store.EnforcementCount]int64{}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -217,14 +217,38 @@ func (h *Handler) ComplianceReport(c *gin.Context) {
 			// stopped it".
 			"policy_violations_detected": counts[store.AuditAppPolicyViolation],
 
-			"programs_terminated":   enforcement[store.EnforceTerminate],
-			"launches_blocked":      enforcement[store.EnforceLock],
-			"applications_removed":  enforcement[store.EnforceQuarantine],
-			"applications_restored": enforcement[store.EnforceUnlock] + enforcement[store.EnforceRestore],
-			"policies_refused":      enforcement[store.EnforceRefused],
+			// Every figure here counts what an endpoint DID, not what it was
+			// asked to do. These were the same query until elevation showed
+			// why they are not the same question.
+			"programs_terminated":   store.Applied(enforcement, store.EnforceTerminate),
+			"launches_blocked":      store.Applied(enforcement, store.EnforceLock),
+			"applications_removed":  store.Applied(enforcement, store.EnforceQuarantine),
+			"applications_restored": store.Applied(enforcement, store.EnforceUnlock, store.EnforceRestore),
+			"policies_refused":      store.Applied(enforcement, store.EnforceRefused),
 
-			// Elevation is a separate control and is not built.
-			"elevated": counts[store.AuditAppElevated],
+			// Elevation: grants are configuration, launches are events. They
+			// are counted apart because "we allowed this" and "somebody used
+			// it" answer different questions, and conflating them would let a
+			// policy that was never exercised read as privilege handed out.
+			//
+			// Counted on OUTCOME as well, which they were not before. No
+			// platform implements elevation yet, so every elevate event an
+			// endpoint files is a refusal — and counting those as grants made
+			// this report state a number of privileges handed out that rose
+			// every few minutes while the true figure was zero. For a
+			// compliance report, stating the opposite of the truth about
+			// privilege is the worst thing it can do.
+			"elevation_grants":   store.Applied(enforcement, store.EnforceElevate),
+			"elevation_launches": store.Applied(enforcement, store.EnforceElevateLaunch),
+			"elevation_revoked":  store.Applied(enforcement, store.EnforceElevateRevoked),
+
+			// The companion figure, reported rather than left as the gap
+			// between two numbers nobody subtracts: rules asking for
+			// elevation that the endpoint could not honour. While elevation is
+			// unimplemented this is the only non-zero elevation figure, and it
+			// is the one an auditor needs.
+			"elevation_not_honoured": store.NotApplied(enforcement,
+				store.EnforceElevate, store.EnforceElevateLaunch),
 		},
 
 		"policies": gin.H{

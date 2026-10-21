@@ -122,3 +122,37 @@ func TestTheAgentTracksQuarantineSeparately(t *testing.T) {
 		t.Error("quarantine deletes the original application instead of moving it")
 	}
 }
+
+// The outcome strings decide what the backend DOES with a report — which rows
+// the compliance report counts as failures, and which events raise an alert.
+// They were compared as bare literals here while only the agent defined them,
+// so a rename on the agent would not fail a build: the comparisons would
+// simply stop matching and the alerting would go quiet.
+func TestEnforcementOutcomeNamesMatchTheAgent(t *testing.T) {
+	src := readAgentFile(t, "internal/appcontrol/appcontrol.go")
+
+	for name, want := range map[string]string{
+		OutcomeApplied: `OutcomeApplied = "applied"`,
+		OutcomeFailed:  `OutcomeFailed  = "failed"`,
+		OutcomeSkipped: `OutcomeSkipped = "skipped"`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the agent no longer spells %q as the backend expects (%s)", name, want)
+		}
+	}
+}
+
+// Elevation alerting keys on these two mechanisms. If the agent renames
+// either, the mail stops and nothing says so.
+func TestElevationMechanismNamesMatchTheAgent(t *testing.T) {
+	src := readAgentFile(t, "internal/appcontrol/elevate.go")
+
+	for name, want := range map[string]string{
+		EnforceElevate:       `MechanismElevate = "elevate"`,
+		EnforceElevateLaunch: `MechanismElevateLaunch`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the agent no longer spells %q as the backend expects (%s)", name, want)
+		}
+	}
+}

@@ -4,21 +4,49 @@ import (
 	"github.com/vsay/vsay-agent-backend/internal/store"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
 
-// latestAgentVersion returns the version the portal considers "latest". It is set
-// manually via the LATEST_AGENT_VERSION env var on the backend (matches whatever
-// packages were last deployed via `make deploy-binaries`).
-func latestAgentVersion() string {
-	v := strings.TrimSpace(os.Getenv("LATEST_AGENT_VERSION"))
-	if v == "" {
-		return "unknown"
+// agentBinariesDir is where the deployed agent packages live. Kept in step
+// with the same lookup in cmd/server/main.go, which serves downloads from it.
+func agentBinariesDir() string {
+	if v := strings.TrimSpace(os.Getenv("AGENT_BINARIES_DIR")); v != "" {
+		return v
 	}
-	return v
+	return "./agent-binaries"
+}
+
+// latestAgentVersion returns the version the portal considers "latest".
+//
+// The VERSION file beside the packages wins, because `make deploy-binaries`
+// writes it at the moment it copies them: whatever is offered for download and
+// whatever is called "latest" then come from one act, and cannot disagree.
+//
+// They used to be set separately — packages by a build, "latest" by hand in
+// LATEST_AGENT_VERSION — and they drifted, as two hand-synchronised copies of
+// a fact always do. The backend was advertising 1.2.1-rc3 while the files on
+// disk were 1.0.0-rc3. That is not a cosmetic mismatch: an update is offered
+// whenever current != latest, so every agent updated successfully, reported
+// the version it had actually installed, still did not match, and was offered
+// the same update again for ever. From the portal it looks exactly like an
+// update that never applies.
+//
+// The env var is still honoured, as an override for a deployment that serves
+// packages from somewhere this process cannot read.
+func latestAgentVersion() string {
+	if b, err := os.ReadFile(filepath.Join(agentBinariesDir(), "VERSION")); err == nil {
+		if v := strings.TrimSpace(string(b)); v != "" {
+			return v
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("LATEST_AGENT_VERSION")); v != "" {
+		return v
+	}
+	return "unknown"
 }
 
 // backendPublicURL is the externally-reachable base URL agents use to download
@@ -60,32 +88,42 @@ func detectOSArch(osInfo string) (osName, arch string) {
 	return osName, arch
 }
 
-// selfUpdateURL maps a normalized (osName, arch) to the full download URL of the
-// matching agent package. Filenames match those produced by `make deploy-binaries`.
-func selfUpdateURL(osName, arch string) string {
-	base := backendPublicURL() + "/agent/download/"
+// selfUpdatePackage is the file `make deploy-binaries` publishes for one
+// platform, or "" where this product has no package.
+//
+// These names were "vsay-agent-…" until 2026-10-21, a leftover from the fork
+// this product was made from, while the Makefile has always deployed
+// "wxt-agent-…". Every self-update therefore asked for a file that does not
+// exist and died on a 404 — and the comment above this function claimed the
+// names matched what the Makefile produced, which is why nobody checked. They
+// are pinned against the Makefile by a test now, because nothing else about
+// this agrees at compile time.
+//
+// Linux returns "" rather than a .deb or a tar.gz: EPM targets Windows and
+// macOS, the Makefile builds nothing else, and returning a plausible URL for a
+// file that was never built is how this bug worked.
+func selfUpdatePackage(osName, arch string) string {
+	if arch != "arm64" {
+		arch = "amd64"
+	}
 	switch osName {
 	case "windows":
-		if arch == "arm64" {
-			return base + "vsay-agent-arm64.exe"
-		}
-		return base + "vsay-agent-amd64.exe"
+		return "wxt-agent-" + arch + ".exe"
 	case "darwin":
-		if arch == "arm64" {
-			return base + "vsay-agent-arm64.dmg"
-		}
-		return base + "vsay-agent-amd64.dmg"
-	case "debian":
-		if arch == "arm64" {
-			return base + "vsay-agent-arm64.deb"
-		}
-		return base + "vsay-agent-amd64.deb"
-	default: // rhel, rocky, generic linux → tar.gz
-		if arch == "arm64" {
-			return base + "vsay-agent-aarch64.tar.gz"
-		}
-		return base + "vsay-agent-x86_64.tar.gz"
+		return "wxt-agent-" + arch + ".dmg"
+	default:
+		return ""
 	}
+}
+
+// selfUpdateURL is where the agent fetches its own replacement, or "" where
+// there is nothing to fetch.
+func selfUpdateURL(osName, arch string) string {
+	pkg := selfUpdatePackage(osName, arch)
+	if pkg == "" {
+		return ""
+	}
+	return backendPublicURL() + "/agent/download/" + pkg
 }
 
 // agentVersionOf returns the version the machine reported in register metadata.
@@ -143,6 +181,17 @@ func (h *Handler) UpdateAgent(c *gin.Context) {
 
 	osName, arch := detectOSArch(machine.OS)
 	downloadURL := selfUpdateURL(osName, arch)
+	if downloadURL == "" {
+		// Refused here rather than sent as a URL that will 404 on the
+		// endpoint. The agent cannot tell a missing package from a broken
+		// server, so it reports "download failed" either way — and the
+		// portal would show an update that was dispatched successfully.
+		c.JSON(http.StatusNotImplemented, gin.H{
+			"error": "No agent package is published for " + osName + "/" + arch +
+				". This product builds packages for Windows and macOS only.",
+		})
+		return
+	}
 
 	if err := h.agentManager.SendUpdateCommand(agentID, downloadURL); err != nil {
 		h.logger.Error("Failed to send update command",

@@ -31,6 +31,7 @@ type MongoDB struct {
 	AppPolicies          *mongo.Collection
 	AppControlSettings   *mongo.Collection
 	EnforcementEvents    *mongo.Collection
+	NotificationClaims   *mongo.Collection
 	RemoteAccessPolicies *mongo.Collection
 }
 
@@ -68,6 +69,7 @@ func NewMongoDB(uri, dbName string) (*MongoDB, error) {
 		AppPolicies:          db.Collection("app_policies"),
 		AppControlSettings:   db.Collection("app_control_settings"),
 		EnforcementEvents:    db.Collection("enforcement_events"),
+		NotificationClaims:   db.Collection("notification_claims"),
 		RemoteAccessPolicies: db.Collection("remote_access_policies"),
 	}
 
@@ -142,6 +144,29 @@ func (m *MongoDB) ensureIndexes(ctx context.Context) error {
 		// which is the question anybody actually asks of it.
 		{Keys: bson.D{{Key: "created_at", Value: 1}},
 			Options: options.Index().SetExpireAfterSeconds(int32(365 * 24 * 3600))},
+	})
+	if err != nil {
+		return err
+	}
+
+	// notification_claims is a dedup ledger, not a log.
+	//
+	// An endpoint re-reports a standing condition — "this elevation rule
+	// cannot be honoured here" — for as long as the rule stands, collapsed by
+	// the agent to one event every five minutes. Mailing each one is 288
+	// messages a day per application per machine, which trains people to
+	// filter the alert and so costs more than sending nothing.
+	//
+	// A claim is taken by INSERTING the key: the unique _id makes that atomic,
+	// so two backends racing on the same event cannot both win and send. Each
+	// row carries its own expires_at and the TTL monitor removes it, which is
+	// what lets different notifications choose different cooldowns from one
+	// collection. Mongo sweeps about once a minute, so a cooldown is a floor
+	// rather than an exact interval — fine for suppressing mail, and the
+	// reason this must never be used to gate anything that needs real timing.
+	_, err = m.NotificationClaims.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "expires_at", Value: 1}},
+			Options: options.Index().SetExpireAfterSeconds(0)},
 	})
 	if err != nil {
 		return err

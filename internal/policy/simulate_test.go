@@ -208,3 +208,54 @@ func itoa(n int) string {
 	}
 	return string(buf[i:])
 }
+
+// "Would be elevated: 3" is a promise, and this product cannot keep it: no
+// platform implements elevation, so those three installs keep exactly the
+// rights they already have. The figure is still worth showing — it is the
+// reach of the rule — but it must not be shown alone.
+//
+// This is the same failure the elevate action has already been shipped with
+// once: something that looks configured, reports a number, and changes
+// nothing on the endpoint.
+func TestASimulationThatProjectsElevationSaysNothingIsElevated(t *testing.T) {
+	const admission = "Nothing is elevated yet"
+
+	t.Run("said when a rule would elevate something", func(t *testing.T) {
+		p := policy("devs-get-docker", store.PolicyScopeTenant, 0,
+			rule("docker", store.ActionElevate, store.MatchCriteria{AppName: equals("Docker Desktop")}))
+		m := &store.Machine{AgentID: "a1", Name: "dev-01", TenantID: "t1"}
+
+		got, err := simulatorFor(p, m).Run(streamOf(
+			install("a1", "dev-01", "Docker Desktop", "Docker Inc"),
+		))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got.ByAction[store.ActionElevate].Installs == 0 {
+			t.Fatal("the rule matched nothing — this test is no longer exercising elevation")
+		}
+		if !strings.Contains(strings.Join(got.Limits, " "), admission) {
+			t.Errorf("the projection reported %d installs as elevated without saying that "+
+				"none of them will be", got.ByAction[store.ActionElevate].Installs)
+		}
+	})
+
+	t.Run("not said when nothing would be elevated", func(t *testing.T) {
+		p := policy("no-games", store.PolicyScopeTenant, 0,
+			rule("games", store.ActionBlock, store.MatchCriteria{AppName: equals("Steam")}))
+		m := &store.Machine{AgentID: "a1", Name: "dev-01", TenantID: "t1"}
+
+		got, err := simulatorFor(p, m).Run(streamOf(
+			install("a1", "dev-01", "Steam", "Valve"),
+		))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if strings.Contains(strings.Join(got.Limits, " "), admission) {
+			t.Error("a caveat about elevation appeared for a policy that does not elevate — " +
+				"noise here trains people to skip the one list that admits what this cannot do")
+		}
+	})
+}

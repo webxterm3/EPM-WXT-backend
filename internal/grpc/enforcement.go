@@ -124,6 +124,142 @@ func (s *AgentServer) handleEnforcementReport(agentID, payload string) {
 		zap.String("machine", machine.Name),
 		zap.Int("events", len(rows)),
 		zap.String("enforced_by", report.Mechanism))
+
+	// Alerting runs after the write, and never blocks it. The record is the
+	// thing that must not be lost; the mail is a convenience on top of it.
+	go s.alertOnElevation(machine, rows)
+}
+
+// Cooldowns for the two elevation alerts.
+//
+// They differ because the things they report differ. An application actually
+// running with administrator rights is an event, and worth hearing about each
+// time it happens on a new day. A rule that cannot be honoured is a standing
+// condition the endpoint re-reports for as long as the rule exists — so it is
+// worth saying once a day, not every five minutes for ever.
+const (
+	elevationGrantedCooldown   = time.Hour
+	elevationUnavailableCooldn = 24 * time.Hour
+	// Short, because what matters about a refusal is that it is happening
+	// repeatedly, and a long window would report a hundred attempts as one.
+	elevationRefusedCooldown = 15 * time.Minute
+)
+
+// The four things that can be said about an elevation event.
+const (
+	elevationGranted     = "granted"
+	elevationLaunched    = "launched"
+	elevationUnavailable = "unavailable"
+	elevationRefused     = "refused"
+)
+
+// classifyElevation decides which of the four an event is, and how long to
+// stay quiet about another like it.
+//
+// Pure, and separate from the sending, because the routing is the part that
+// was wrong: the first version had two branches and keyed only on the outcome,
+// so a FAILED elevate-launch — somebody trying to start something with
+// administrator rights and being refused — was mailed as "this rule is not
+// being honoured on this machine". Those are opposite facts. One says the
+// administrator's configuration is broken; the other says their configuration
+// is working and somebody is pushing against it. Sending the first when the
+// second is true dispatches them to repair a rule that is doing its job, while
+// the probing continues.
+func classifyElevation(mechanism, outcome string) (kind string, cooldown time.Duration, ok bool) {
+	switch {
+	case mechanism == store.EnforceElevate && outcome == store.OutcomeApplied:
+		return elevationGranted, elevationGrantedCooldown, true
+
+	// An application actually RAN elevated: the most security-relevant event
+	// this product can report, and given its own kind so it claims separately
+	// from the grant that permitted it.
+	case mechanism == store.EnforceElevateLaunch && outcome == store.OutcomeApplied:
+		return elevationLaunched, elevationGrantedCooldown, true
+
+	// A standing condition. The endpoint re-reports it for as long as the rule
+	// exists, so it is said once a day.
+	case mechanism == store.EnforceElevate && outcome == store.OutcomeFailed:
+		return elevationUnavailable, elevationUnavailableCooldn, true
+
+	// An attempt, not a condition. What matters is REPETITION, so the window
+	// is short — a daily digest would report a hundred attempts as one.
+	case mechanism == store.EnforceElevateLaunch && outcome == store.OutcomeFailed:
+		return elevationRefused, elevationRefusedCooldown, true
+	}
+	return "", 0, false
+}
+
+// alertOnElevation mails about privileges being GIVEN.
+//
+// Everything else application control reports is a restriction, where the
+// worst case of a mistake is software that will not start. This is the one
+// direction that hands out administrator rights, and the one where finding out
+// a month later from a report is too late.
+//
+// The second case — a rule the machine cannot honour — is mailed for the
+// opposite reason: the administrator who wrote it believes software is running
+// elevated and it is not. That is the failure this product has already shipped
+// twice, and a notification is what stops the third time being discovered
+// months later.
+func (s *AgentServer) alertOnElevation(machine *store.Machine, rows []store.EnforcementEvent) {
+	// NotifyEmails is collected from authorised people who have opened this
+	// machine in the portal. None yet is not a failure.
+	if len(machine.NotifyEmails) == 0 {
+		return
+	}
+
+	for _, e := range rows {
+		isElevation := e.Mechanism == store.EnforceElevate || e.Mechanism == store.EnforceElevateLaunch
+		if !isElevation {
+			continue
+		}
+
+		var send func() error
+
+		kind, cooldown, ok := classifyElevation(e.Mechanism, e.Outcome)
+		if !ok {
+			continue
+		}
+
+		switch kind {
+		case elevationGranted, elevationLaunched:
+			send = func() error {
+				return s.email.SendElevationAlert(machine.NotifyEmails,
+					machine.Name, e.AppName, e.Path, e.Rule, e.Policy, "", e.At)
+			}
+		case elevationUnavailable:
+			send = func() error {
+				return s.email.SendElevationUnavailable(machine.NotifyEmails,
+					machine.Name, e.AppName, e.Rule, e.Policy, e.Detail)
+			}
+		case elevationRefused:
+			send = func() error {
+				return s.email.SendElevationRefused(machine.NotifyEmails,
+					machine.Name, e.AppName, e.Path, "", e.Detail, e.At)
+			}
+		}
+
+		// The key deliberately leaves out the time and the event id: both
+		// would make every claim unique and turn the suppression off without
+		// anything appearing to be wrong.
+		key := store.NotificationKey("elevation", kind, machine.TenantID, machine.AgentID, e.AppName)
+		ok, err := s.store.ClaimNotification(key, cooldown)
+		if err != nil {
+			// Claiming fails open, so this is a warning about the dedup, not
+			// about the alert — which is being sent.
+			s.logger.Warn("elevation alert: could not record the notification claim",
+				zap.String("key", key), zap.Error(err))
+		}
+		if !ok {
+			continue
+		}
+
+		if err := send(); err != nil {
+			s.logger.Warn("elevation alert: email failed",
+				zap.String("machine", machine.Name),
+				zap.String("app", e.AppName), zap.Error(err))
+		}
+	}
 }
 
 // clampField bounds one piece of agent-supplied text.

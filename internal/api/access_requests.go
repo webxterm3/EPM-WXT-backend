@@ -109,15 +109,38 @@ func (h *Handler) CreateAccessRequest(c *gin.Context) {
 		return
 	}
 
-	// Attempt to notify owner via email if owner_email is known (best-effort)
-	if accessReq.OwnerEmail != "" {
+	// Notify the people who can act on this request.
+	//
+	// This block used to be guarded by `accessReq.OwnerEmail != ""`, and
+	// OwnerEmail is assigned the empty string a few lines above with the
+	// comment "not available at creation time" — so the guard was never true
+	// and SendAccessRequestNotification was dead code. Nobody has ever been
+	// emailed about a request, which makes the whole approval flow depend on
+	// somebody happening to notice a pending count in a portal page.
+	//
+	// The backend holds no user records, so there is genuinely no way to look
+	// up the owner's address here. What it does have is the machine's
+	// NotifyEmails: the people who have opened this machine in the portal and
+	// were authorised to. That is a superset of the approvers rather than
+	// exactly them, which is the right direction to err for a request that is
+	// waiting on a human.
+	recipients := make([]string, 0, len(machine.NotifyEmails))
+	for _, addr := range machine.NotifyEmails {
+		// Not the requester: they know, they just asked.
+		if addr != "" && !strings.EqualFold(addr, requesterEmail) {
+			recipients = append(recipients, addr)
+		}
+	}
+	if len(recipients) > 0 {
 		go func() {
-			if err := emailService.SendAccessRequestNotification(
-				accessReq.OwnerEmail, "",
-				requesterUsername, machine.Name,
-				req.DurationHours, req.RequestNote,
-			); err != nil {
-				h.logger.Warn("Failed to send access request notification email", zap.Error(err))
+			for _, addr := range recipients {
+				if err := emailService.SendAccessRequestNotification(
+					addr, "", requesterUsername, machine.Name,
+					req.DurationHours, req.RequestNote,
+				); err != nil {
+					h.logger.Warn("access request: notification email failed",
+						zap.String("to", addr), zap.Error(err))
+				}
 			}
 		}()
 	}

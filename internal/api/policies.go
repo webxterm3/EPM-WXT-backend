@@ -57,6 +57,11 @@ func (h *Handler) ListAppPolicies(c *gin.Context) {
 		// Said out loud on every read so the UI never has to assume whether
 		// these are being applied or only projected.
 		"enforcement_enabled": h.enforcementEnabled(tenantID),
+		// Likewise for the alerts. An administrator who switches on a rule
+		// that mails when administrator rights are granted, and never receives
+		// anything, has no way to tell a quiet fleet from a server with no
+		// SMTP configured. The list is the screen they are already looking at.
+		"email_notifications": emailService.Configured(),
 	})
 }
 
@@ -410,7 +415,22 @@ func (h *Handler) GetAppControlSettings(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load settings"})
 		return
 	}
-	c.JSON(http.StatusOK, settings)
+
+	// Whether an alert would actually be delivered, stated rather than left to
+	// be inferred from its absence.
+	//
+	// Send is a no-op when no SMTP is configured, which is the right default
+	// for an optional notification and the wrong thing to be quiet about: an
+	// administrator who expects mail about administrator rights being granted,
+	// and never receives any, cannot tell "nothing happened" from "nothing was
+	// ever going to be sent". This is the difference, on the screen where the
+	// alerts are switched on.
+	// Embedded rather than rebuilt field by field, so adding this cannot drop
+	// one the portal already reads.
+	c.JSON(http.StatusOK, struct {
+		*store.AppControlSettings
+		EmailNotifications bool `json:"email_notifications"`
+	}{settings, emailService.Configured()})
 }
 
 // SetAppControlEnforcement handles PUT /api/app-control/settings.
@@ -480,6 +500,11 @@ func enforcementMessage(on bool) string {
 	return "Enforcement is off. Policies are evaluated and reported, and nothing is blocked."
 }
 
+// searchTermLimit caps a typed search before it reaches the database.
+// Unbounded input becomes an unbounded regex, which is a way to make the
+// database do arbitrary work from a query string.
+const searchTermLimit = 200
+
 // ListEnforcementEvents handles GET /api/app-control/events.
 //
 // This is the answer to "why did my application stop working", and the only
@@ -501,8 +526,23 @@ func (h *Handler) ListEnforcementEvents(c *gin.Context) {
 		limit = 50
 	}
 
-	events, total, err := h.store.GetEnforcementEvents(
-		tenantID, strings.TrimSpace(c.Query("agent_id")), limit, (page-1)*limit)
+	// Searching happens here rather than in the browser, because the browser
+	// only ever holds one page. Filtering those fifty rows would answer
+	// "where is Steam on this page", which is never the question — the whole
+	// point of the search is to find the one event somewhere in a year of
+	// them.
+	search := strings.TrimSpace(c.Query("q"))
+	if len(search) > searchTermLimit {
+		search = search[:searchTermLimit]
+	}
+
+	events, total, err := h.store.GetEnforcementEvents(store.EnforcementEventQuery{
+		TenantID: tenantID,
+		AgentID:  strings.TrimSpace(c.Query("agent_id")),
+		Search:   search,
+		Limit:    limit,
+		Skip:     (page - 1) * limit,
+	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load enforcement activity"})
 		return
@@ -513,6 +553,10 @@ func (h *Handler) ListEnforcementEvents(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"events": events, "total": total, "page": page, "limit": limit,
+		// Echoed back so the UI can say "no events match X" rather than
+		// "no events", which are different facts and send people looking in
+		// different places.
+		"search":              search,
 		"enforcement_enabled": h.enforcementEnabled(tenantID),
 	})
 }

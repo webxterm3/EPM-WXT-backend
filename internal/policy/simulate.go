@@ -170,6 +170,22 @@ func (s *Simulator) Run(stream func(func(*store.InstalledApp) error) error) (Sim
 	sim.Summary.MachinesAffected = len(affected)
 	sim.Summary.AppsEvaluated = len(appsSeen)
 
+	// "Would be elevated: 42" is a promise this product cannot keep yet, and a
+	// number beside the word "would" reads as one. No platform implements
+	// elevation — the agent's platformElevator reports unsupported on both
+	// Windows and macOS — so the honest reading of that figure is "how many
+	// installs a rule points at", not "how many will gain admin rights".
+	//
+	// Added only when the figure is non-zero: a caveat about something the
+	// policy does not do is noise that trains people to skip the list, and
+	// this list is the one place the projection admits what it is not.
+	if sim.ByAction[store.ActionElevate].Installs > 0 {
+		sim.Limits = append([]string{
+			"Nothing is elevated yet: no platform implements it, so these installs keep the rights they have now. " +
+				"Each endpoint reports the rule as one it cannot honour.",
+		}, sim.Limits...)
+	}
+
 	sim.TopApps = topApps(impacts)
 	sim.Machines = topMachines(machineImpacts)
 	for _, c := range conflicts {

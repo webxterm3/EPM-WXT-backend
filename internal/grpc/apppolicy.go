@@ -3,6 +3,7 @@ package grpc
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -132,4 +133,72 @@ func (p *PolicyPusher) pushResolved(machine *store.Machine, policies []*store.Ap
 		return fmt.Errorf("encoding the policy: %w", err)
 	}
 	return p.manager.SendAppPolicy(machine.AgentID, string(encoded))
+}
+
+// PolicyRequestDiscriminator is the agent asking for its policy now, because
+// somebody pressed "Sync Now" in the menu bar.
+//
+// Must match the constant in the agent — pinned by the drift test, because a
+// rename on either side would not fail a build here. The button would simply
+// stop working, and the menu bar cannot tell: it writes a file and has no way
+// to learn whether anything answered.
+const PolicyRequestDiscriminator = "__policy_request__"
+
+// policyRequestMinGap is the shortest time between two honoured requests from
+// one machine.
+//
+// The button is pressed by a person, so the honest rate is a few per minute at
+// most. The limit is not there to protect against that: it is there because
+// the request arrives over a channel an endpoint controls, and a machine that
+// sent it in a loop would have the backend resolve policy for it as fast as it
+// could ask.
+const policyRequestMinGap = 5 * time.Second
+
+// handlePolicyRequest pushes this machine's policy, on request.
+//
+// The agent sends no policy and asks for none in particular — only "send me
+// mine". Everything about what that means is resolved here from the machine
+// record, so the request is not a way to obtain somebody else's policy or to
+// get a policy earlier than the fleet would.
+func (s *AgentServer) handlePolicyRequest(agentID string) {
+	if s.policyPusher == nil {
+		return
+	}
+
+	if !s.allowPolicyRequest(agentID) {
+		s.logger.Debug("policy sync: ignoring a request that arrived too soon",
+			zap.String("agent_id", agentID))
+		return
+	}
+
+	machine, err := s.store.GetMachineByAgentID(agentID)
+	if err != nil || machine == nil {
+		s.logger.Warn("policy sync: unknown agent asked for a policy",
+			zap.String("agent_id", agentID), zap.Error(err))
+		return
+	}
+
+	if err := s.policyPusher.PushTo(machine); err != nil {
+		s.logger.Warn("policy sync: could not push on request",
+			zap.String("agent_id", agentID), zap.Error(err))
+		return
+	}
+	s.logger.Info("policy sync: pushed on request",
+		zap.String("agent_id", agentID), zap.String("machine", machine.Name))
+}
+
+// allowPolicyRequest rate-limits one machine's requests.
+func (s *AgentServer) allowPolicyRequest(agentID string) bool {
+	s.policyReqMu.Lock()
+	defer s.policyReqMu.Unlock()
+
+	if s.policyReqAt == nil {
+		s.policyReqAt = map[string]time.Time{}
+	}
+	now := time.Now()
+	if last, ok := s.policyReqAt[agentID]; ok && now.Sub(last) < policyRequestMinGap {
+		return false
+	}
+	s.policyReqAt[agentID] = now
+	return true
 }

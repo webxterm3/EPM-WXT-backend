@@ -163,6 +163,21 @@ func (m *RemoteControlManager) HandleAgentData(sessionID string, data []byte) {
 	}
 	if s.State == rcStateActive && s.StartedAt.IsZero() {
 		s.StartedAt = time.Now()
+
+		// Tell the people who use this machine, once, at the moment watching
+		// actually begins.
+		//
+		// Here rather than in StartRemoteControl because that only ASKS: the
+		// session is still awaiting consent, and mailing there would announce
+		// sessions that were refused or timed out. StartedAt.IsZero() is what
+		// makes this fire exactly once — every later state report from the
+		// same session finds it set.
+		//
+		// The fields are passed as arguments rather than captured, because s
+		// is guarded by m.mu and reading it inside the goroutine would race
+		// with the next report. Arguments are evaluated here, still holding
+		// the lock.
+		go m.notifySessionStarted(agentID, s.AdminName, s.ViewOnly, s.StartedAt)
 	}
 	s.UpdatedAt = time.Now()
 
@@ -171,6 +186,41 @@ func (m *RemoteControlManager) HandleAgentData(sessionID string, data []byte) {
 		zap.String("state", s.State),
 		zap.String("event", msg.Event),
 		zap.String("session", s.SessionID))
+}
+
+// notifySessionStarted mails everyone who uses the machine that a remote
+// session has begun.
+//
+// Best-effort and off the hot path: a mail server that is slow, or missing
+// altogether, must not delay or fail the session it is reporting on. When no
+// SMTP is configured the send is a no-op, which is the right default for an
+// optional alert.
+func (m *RemoteControlManager) notifySessionStarted(agentID, operator string, viewOnly bool, at time.Time) {
+	machine, err := m.store.GetMachineByAgentID(agentID)
+	if err != nil || machine == nil {
+		return
+	}
+	// NotifyEmails is collected opportunistically from authorised people who
+	// have opened this machine in the portal. A machine nobody has looked at
+	// yet has no recipients, and that is not a failure.
+	if len(machine.NotifyEmails) == 0 {
+		return
+	}
+
+	kind := "full control"
+	if viewOnly {
+		kind = "view only"
+	}
+	if operator == "" {
+		operator = "an administrator"
+	}
+
+	if err := emailService.SendRemoteSessionAlert(
+		machine.NotifyEmails, machine.Name, operator, kind, "", at,
+	); err != nil {
+		m.logger.Warn("remote session: alert email failed",
+			zap.String("agent_id", agentID), zap.Error(err))
+	}
 }
 
 func isFailureState(state string) bool {
