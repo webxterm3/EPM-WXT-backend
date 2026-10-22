@@ -1,6 +1,8 @@
 package api
 
 import (
+	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"strconv"
@@ -8,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/vsay/vsay-agent-backend/internal/approvers"
 	emailsvc "github.com/vsay/vsay-agent-backend/internal/email"
 	"github.com/vsay/vsay-agent-backend/internal/store"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -31,9 +34,32 @@ var emailService = emailsvc.New()
 // POST /api/access-requests
 func (h *Handler) CreateAccessRequest(c *gin.Context) {
 	var req struct {
-		MachineID     string `json:"machine_id" binding:"required"`
-		DurationHours int    `json:"duration_hours"` // 0 = no expiration
+		MachineID string `json:"machine_id" binding:"required"`
+		// Minutes, so a fifteen-minute window can be asked for. Ignored when
+		// an explicit from/to window is given, which states its own length.
+		DurationMinutes int `json:"duration_minutes"`
+		// Accepted from clients that have not been updated.
+		DurationHours int    `json:"duration_hours"`
+		Title         string `json:"title"`
 		RequestNote   string `json:"request_note"`
+
+		// The window the session may run in. RFC3339, both optional.
+		NotBefore string `json:"not_before"`
+		NotAfter  string `json:"not_after"`
+
+		Asks struct {
+			RemoteSupport *struct {
+				Reason  string `json:"reason"`
+				Control string `json:"control"`
+			} `json:"remote_support"`
+			AdminAccess *struct {
+				Reason string `json:"reason"`
+			} `json:"admin_access"`
+			AppInstall *struct {
+				Reason       string   `json:"reason"`
+				Applications []string `json:"applications"`
+			} `json:"app_install"`
+		} `json:"asks"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -41,9 +67,87 @@ func (h *Handler) CreateAccessRequest(c *gin.Context) {
 		return
 	}
 
-	// 0 = no expiration; any positive value must be at most 8760h (1 year)
-	if req.DurationHours < 0 || req.DurationHours > 8760 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "duration_hours must be 0 (no expiration) or between 1 and 8760"})
+	// The window first, because it can decide the duration.
+	notBefore, notAfter, err := parseWindow(req.NotBefore, req.NotAfter)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	minutes := req.DurationMinutes
+	if minutes == 0 && req.DurationHours > 0 {
+		minutes = req.DurationHours * 60
+	}
+	// A from/to window states its own length, and two sources of truth for
+	// how long a grant lasts is one of them being wrong. The window wins.
+	if notBefore != nil && notAfter != nil {
+		minutes = int(notAfter.Sub(*notBefore).Minutes())
+	}
+
+	// A duration is required.
+	//
+	// It used to be optional, and zero meant NEVER EXPIRES — so a client that
+	// forgot the field, or asked for a window shorter than the hour it was
+	// rounded into, was granted permanent access. For a feature whose whole
+	// purpose is that access ends on its own, that default was backwards.
+	if minutes <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "how long the access is needed for is required, and must be at least a minute",
+		})
+		return
+	}
+	if minutes > maxAccessMinutes {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "access cannot be requested for longer than 30 days",
+		})
+		return
+	}
+
+	// Build the asks, refusing anything that would be approved without
+	// meaning something.
+	var asks store.AccessAsks
+	if a := req.Asks.RemoteSupport; a != nil {
+		control := a.Control
+		if control == "" {
+			// The narrower of the two. Somebody who does not say must not be
+			// handed the larger grant by default.
+			control = store.AccessLevelView
+		}
+		if !validAccessLevel(control) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "unknown control level for remote support"})
+			return
+		}
+		asks.RemoteSupport = &store.RemoteSupportAsk{
+			Reason: strings.TrimSpace(a.Reason), Control: control,
+		}
+	}
+	if a := req.Asks.AdminAccess; a != nil {
+		asks.AdminAccess = &store.AdminAccessAsk{Reason: strings.TrimSpace(a.Reason)}
+	}
+	if a := req.Asks.AppInstall; a != nil {
+		apps := make([]string, 0, len(a.Applications))
+		for _, name := range a.Applications {
+			if n := strings.TrimSpace(name); n != "" {
+				apps = append(apps, n)
+			}
+		}
+		// "May install software" and "may install Docker Desktop" are
+		// different grants, and only the second is one an approver can weigh.
+		if len(apps) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "name at least one application to install, or turn that off",
+			})
+			return
+		}
+		asks.AppInstall = &store.AppInstallAsk{
+			Reason: strings.TrimSpace(a.Reason), Applications: apps,
+		}
+	}
+
+	if !asks.Any() {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "choose at least one thing you need — a request that asks for nothing cannot be approved",
+		})
 		return
 	}
 
@@ -98,8 +202,12 @@ func (h *Handler) CreateAccessRequest(c *gin.Context) {
 		TenantID:          tenantID,
 		OwnerID:           machine.OwnerID.Hex(),
 		OwnerEmail:        "", // not available at creation time
+		Title:             strings.TrimSpace(req.Title),
 		RequestNote:       req.RequestNote,
-		DurationHours:     req.DurationHours,
+		DurationMinutes:   minutes,
+		Asks:              asks,
+		NotBefore:         notBefore,
+		NotAfter:          notAfter,
 		Status:            "pending",
 	}
 
@@ -124,19 +232,46 @@ func (h *Handler) CreateAccessRequest(c *gin.Context) {
 	// were authorised to. That is a superset of the approvers rather than
 	// exactly them, which is the right direction to err for a request that is
 	// waiting on a human.
-	recipients := make([]string, 0, len(machine.NotifyEmails))
-	for _, addr := range machine.NotifyEmails {
-		// Not the requester: they know, they just asked.
-		if addr != "" && !strings.EqualFold(addr, requesterEmail) {
-			recipients = append(recipients, addr)
+	// The group's administrators first.
+	//
+	// These are the people named as approvers for the machines in this
+	// machine's groups, and they are the right answer: somebody who knows
+	// whether this person should reach THIS machine. Falling back to everyone
+	// who has opened it in the portal is what happens when no group names an
+	// approver, which is also what happened before group administrators
+	// existed.
+	var recipients []string
+	if len(machine.GroupIDs) > 0 {
+		list, err := h.approvers.ForGroups(c.Request.Context(), machine.GroupIDs)
+		if err != nil {
+			h.logger.Warn("access request: could not resolve the group's approvers",
+				zap.String("machine", machine.Name), zap.Error(err))
 		}
+		recipients = approvers.Emails(list)
 	}
+	if len(recipients) == 0 {
+		recipients = machine.NotifyEmails
+	}
+
+	// The requester is dropped last, so they are removed whichever list they
+	// came from. They know; they just asked.
+	filtered := make([]string, 0, len(recipients))
+	seen := map[string]bool{}
+	for _, addr := range recipients {
+		key := strings.ToLower(strings.TrimSpace(addr))
+		if key == "" || seen[key] || strings.EqualFold(addr, requesterEmail) {
+			continue
+		}
+		seen[key] = true
+		filtered = append(filtered, addr)
+	}
+	recipients = filtered
 	if len(recipients) > 0 {
 		go func() {
 			for _, addr := range recipients {
 				if err := emailService.SendAccessRequestNotification(
 					addr, "", requesterUsername, machine.Name,
-					req.DurationHours, req.RequestNote,
+					minutes, req.RequestNote,
 				); err != nil {
 					h.logger.Warn("access request: notification email failed",
 						zap.String("to", addr), zap.Error(err))
@@ -149,9 +284,10 @@ func (h *Handler) CreateAccessRequest(c *gin.Context) {
 		Action: store.AuditJITRequested, Resource: "access_request",
 		ResourceID: accessReq.ID.Hex(),
 		Details: map[string]any{
-			"machine":        accessReq.MachineName,
-			"duration_hours": accessReq.DurationHours,
-			"note":           accessReq.RequestNote,
+			"machine":          accessReq.MachineName,
+			"duration_minutes": accessReq.DurationMinutes,
+			"asks":             store.DescribeAsks(accessReq.Asks),
+			"note":             accessReq.RequestNote,
 		},
 	})
 	c.JSON(http.StatusCreated, accessReq)
@@ -246,10 +382,7 @@ func (h *Handler) ApproveAccessRequest(c *gin.Context) {
 		return
 	}
 
-	userIDStr := c.GetString("user_id")
-	userID, _ := primitive.ObjectIDFromHex(userIDStr)
 	approverUsername := c.GetString("username")
-	role := c.GetString("role")
 
 	ar, err := h.store.GetAccessRequestByID(id)
 	if err != nil {
@@ -274,8 +407,7 @@ func (h *Handler) ApproveAccessRequest(c *gin.Context) {
 		return
 	}
 
-	if machine.OwnerID != userID && role != "company_admin" && role != "super_admin" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "not authorized"})
+	if !h.mayDecide(c, ar, machine) {
 		return
 	}
 
@@ -285,13 +417,36 @@ func (h *Handler) ApproveAccessRequest(c *gin.Context) {
 	ar.ApprovedBy = approverUsername
 	ar.ApprovedAt = &now
 
-	// Only set an expiry when the requester asked for a time-limited grant
-	var expiresAt *time.Time
-	if ar.DurationHours > 0 {
-		t := now.Add(time.Duration(ar.DurationHours) * time.Hour)
-		expiresAt = &t
-		ar.ExpiresAt = expiresAt
+	// The clock starts when the window opens, not when the approver clicks.
+	//
+	// Somebody can ask on Monday for a window on Saturday. Starting the
+	// countdown at approval would spend the grant before the person could use
+	// it, and the shorter the window the worse that is — a fifteen-minute
+	// grant approved an hour early is simply gone.
+	start := now
+	if ar.NotBefore != nil && ar.NotBefore.After(now) {
+		start = *ar.NotBefore
 	}
+
+	var expiresAt *time.Time
+	switch {
+	case ar.NotAfter != nil:
+		// An explicit window says when it ends. Honoured over the duration,
+		// which is derived from it anyway — and if the two ever disagreed,
+		// the one the requester SAW is the one to keep.
+		expiresAt = ar.NotAfter
+		ar.ExpiresAt = expiresAt
+	default:
+		if mins := ar.Minutes(); mins > 0 {
+			t := start.Add(time.Duration(mins) * time.Minute)
+			expiresAt = &t
+			ar.ExpiresAt = expiresAt
+		}
+	}
+	// A request with no duration at all is one stored before durations were
+	// required, in an encoding where zero meant never expires. Left alone:
+	// changing what an existing grant means, in either direction, is a
+	// decision for whoever made it.
 
 	if err := h.store.UpdateAccessRequest(ar); err != nil {
 		h.logger.Error("Failed to update access request", zap.Error(err))
@@ -321,10 +476,11 @@ func (h *Handler) ApproveAccessRequest(c *gin.Context) {
 		Action: store.AuditJITApproved, Resource: "access_request",
 		ResourceID: ar.ID.Hex(),
 		Details: map[string]any{
-			"requester":      ar.RequesterUsername,
-			"machine":        ar.MachineName,
-			"duration_hours": ar.DurationHours,
-			"expires_at":     ar.ExpiresAt,
+			"requester":        ar.RequesterUsername,
+			"machine":          ar.MachineName,
+			"duration_minutes": ar.Minutes(),
+			"asks":             store.DescribeAsks(ar.Asks),
+			"expires_at":       ar.ExpiresAt,
 		},
 	})
 	c.JSON(http.StatusOK, gin.H{"message": "access request approved", "request": ar})
@@ -352,10 +508,7 @@ func (h *Handler) RejectAccessRequest(c *gin.Context) {
 		return
 	}
 
-	userIDStr := c.GetString("user_id")
-	userID, _ := primitive.ObjectIDFromHex(userIDStr)
 	rejectorUsername := c.GetString("username")
-	role := c.GetString("role")
 
 	ar, err := h.store.GetAccessRequestByID(id)
 	if err != nil {
@@ -380,8 +533,7 @@ func (h *Handler) RejectAccessRequest(c *gin.Context) {
 		return
 	}
 
-	if machine.OwnerID != userID && role != "company_admin" && role != "super_admin" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "not authorized"})
+	if !h.mayDecide(c, ar, machine) {
 		return
 	}
 
@@ -500,6 +652,21 @@ func (h *Handler) RevokeAccessRequest(c *gin.Context) {
 		return
 	}
 
+	// Revoking had NO authorization check whatsoever: any authenticated
+	// caller holding a request id could cut short any active grant, in any
+	// organisation. Cutting access short is the safe direction of the three,
+	// which is presumably why it was never noticed — but it is still somebody
+	// else's session ended by a stranger, and the id is in every notification
+	// email already sent.
+	machine, err := h.store.GetMachineByID(ar.MachineID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "machine not found"})
+		return
+	}
+	if !h.mayDecide(c, ar, machine) {
+		return
+	}
+
 	now := time.Now()
 	ar.Status = "revoked"
 	ar.RevokedBy = revokerUsername
@@ -537,4 +704,134 @@ func (h *Handler) RevokeAccessRequest(c *gin.Context) {
 		},
 	})
 	c.JSON(http.StatusOK, gin.H{"message": "access request revoked", "request": ar})
+}
+
+// mayDecide reports whether this caller may approve, reject or revoke this
+// request, and writes the refusal itself.
+//
+// One function for all three, because they are the same question and three
+// copies of it is two chances to let one drift. It replaces a check that was
+// repeated verbatim and was missing two things:
+//
+//	The TENANT. The check was "owns the machine, or is an admin" — and
+//	"is an admin" was read off a header with no reference to WHICH
+//	organisation. A company_admin holding another tenant's request id could
+//	approve it. Creation checked the tenant; deciding did not.
+//
+//	SELF-APPROVAL. Nothing stopped the requester approving their own
+//	request, and a company_admin asking for access to a machine could
+//	grant it to themselves — which is every approval workflow's first
+//	requirement and the reason one exists at all.
+//
+// Group administrators are the new path: somebody who administers a group the
+// machine belongs to decides for it. That is the point of naming them — the
+// person who knows whether somebody should reach a finance laptop is not the
+// person who knows about an engineering one.
+func (h *Handler) mayDecide(c *gin.Context, ar *store.AccessRequest, machine *store.Machine) bool {
+	userID := c.GetString("user_id")
+	role := c.GetString("role")
+	tenantID := c.GetString("tenant_id")
+
+	// A super_admin is deliberately exempt from the tenant check and from
+	// nothing else: they operate across organisations by definition, but they
+	// still may not approve their own request.
+	if role != middlewareRoleSuperAdmin && machine.TenantID != tenantID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "not authorized"})
+		return false
+	}
+
+	// Nobody decides their own request, whatever else they are.
+	//
+	// Compared on the requester's user id rather than their username: a
+	// username can be changed, and an approval gate that turns on a display
+	// name is one rename away from opening.
+	if ar.RequesterID != "" && ar.RequesterID == userID {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": "You cannot decide your own access request. Someone else has to.",
+		})
+		return false
+	}
+
+	if machine.OwnerID.Hex() == userID {
+		return true
+	}
+	if role == "company_admin" || role == middlewareRoleSuperAdmin {
+		return true
+	}
+
+	// Finally, the group administrators. Asked last because it is the only
+	// branch that makes a network call, and the common cases are decided
+	// above without one.
+	if len(machine.GroupIDs) > 0 {
+		list, err := h.approvers.ForGroups(c.Request.Context(), machine.GroupIDs)
+		if err != nil {
+			// Reported, not swallowed. A lookup that fails silently would
+			// deny a legitimate approver with the same message as a genuine
+			// refusal, and nothing would say which happened.
+			h.logger.Warn("access request: could not resolve the group's approvers",
+				zap.String("machine", machine.Name), zap.Error(err))
+		}
+		if approvers.Includes(list, userID) {
+			return true
+		}
+	}
+
+	c.JSON(http.StatusForbidden, gin.H{"error": "not authorized"})
+	return false
+}
+
+// middlewareRoleSuperAdmin is the role string vsay-auth puts in the header.
+const middlewareRoleSuperAdmin = "super_admin"
+
+// maxAccessMinutes caps a request at thirty days.
+//
+// Not a security boundary — an approver still decides — but a request for a
+// year is almost always a typo, and granting one is harder to notice than
+// refusing it.
+const maxAccessMinutes = 30 * 24 * 60
+
+func validAccessLevel(v string) bool {
+	switch v {
+	case store.AccessLevelView, store.AccessLevelControl:
+		return true
+	}
+	return false
+}
+
+// parseWindow reads the optional from/to the session may run in.
+//
+// A window that has already closed is refused rather than stored: it would
+// sit in the queue looking schedulable, and an approver clicking it would
+// create a grant that expired before it existed.
+func parseWindow(fromStr, toStr string) (from, to *time.Time, err error) {
+	parse := func(v, field string) (*time.Time, error) {
+		if strings.TrimSpace(v) == "" {
+			return nil, nil
+		}
+		t, perr := time.Parse(time.RFC3339, v)
+		if perr != nil {
+			return nil, fmt.Errorf("%s must be an RFC3339 timestamp", field)
+		}
+		return &t, nil
+	}
+
+	if from, err = parse(fromStr, "not_before"); err != nil {
+		return nil, nil, err
+	}
+	if to, err = parse(toStr, "not_after"); err != nil {
+		return nil, nil, err
+	}
+
+	// A start in the past is the same as no start, and storing it would make
+	// the request look scheduled when it is not.
+	if from != nil && !from.After(time.Now()) {
+		from = nil
+	}
+	if to != nil && !to.After(time.Now()) {
+		return nil, nil, errors.New("that window has already closed")
+	}
+	if from != nil && to != nil && !to.After(*from) {
+		return nil, nil, errors.New("the window has to end after it starts")
+	}
+	return from, to, nil
 }

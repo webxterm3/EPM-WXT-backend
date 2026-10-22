@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/vsay/vsay-agent-backend/internal/approvers"
 	"github.com/vsay/vsay-agent-backend/internal/grpc"
 	"github.com/vsay/vsay-agent-backend/internal/store"
 	"github.com/vsay/vsay-agent-backend/internal/upload"
@@ -26,7 +27,11 @@ type Handler struct {
 	uploadService   *upload.Service
 	rdpManager      *RDPManager
 	remoteControl   *RemoteControlManager
-	logger          *zap.Logger
+	// approvers answers "who decides access requests for this machine",
+	// which lives in vsay-auth because that is where groups and their
+	// administrators are. Stateless and safe to share.
+	approvers *approvers.Service
+	logger    *zap.Logger
 }
 
 // SetPolicyPusher wires in the shared policy resolver/pusher.
@@ -40,6 +45,7 @@ func NewHandler(s store.Store, am *grpc.AgentManager, us *upload.Service, l *zap
 		agentManager:    am,
 		terminalManager: NewTerminalManager(l),
 		uploadService:   us,
+		approvers:       approvers.New(),
 		logger:          l,
 	}
 }

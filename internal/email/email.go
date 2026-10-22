@@ -176,7 +176,10 @@ func (s *Service) SendIntrusionAlert(to []string, machineName, protocol, osUser,
 }
 
 // SendAccessRequestNotification notifies the machine owner about a new access request.
-func (s *Service) SendAccessRequestNotification(ownerEmail, ownerName, requesterName, machineName string, durationHours int, note string) error {
+// durationMinutes, not hours: the shortest window the product offers is
+// fifteen minutes, and an approver reading "0 hours" cannot tell a short
+// request from a missing one.
+func (s *Service) SendAccessRequestNotification(ownerEmail, ownerName, requesterName, machineName string, durationMinutes int, note string) error {
 	subject := fmt.Sprintf("New Machine Access Request - %s", machineName)
 
 	noteSection := ""
@@ -190,13 +193,13 @@ func (s *Service) SendAccessRequestNotification(ownerEmail, ownerName, requester
   <h2>New Machine Access Request</h2>
   <p>Hello %s,</p>
   <p><strong>%s</strong> has requested access to your machine <strong>%s</strong>.</p>
-  <p><strong>Requested duration:</strong> %d hour(s)</p>
+  <p><strong>Requested duration:</strong> %s</p>
   %s
   <p>Please log in to the VSay portal to approve or reject this request.</p>
   <hr>
   <p style="color:#888;font-size:12px;">This is an automated notification from VSay.</p>
 </body>
-</html>`, ownerName, requesterName, machineName, durationHours, noteSection)
+</html>`, ownerName, requesterName, machineName, HumanDuration(durationMinutes), noteSection)
 
 	return s.Send(ownerEmail, subject, body)
 }
@@ -419,4 +422,30 @@ func (s *Service) SendElevationRefused(to []string, machineName, appName, path, 
 		esc(appName), esc(machineName), table(rows...))
 
 	return s.fanOut(to, subject, shell("#b91c1c", "Elevation refused", inner))
+}
+
+// HumanDuration puts a number of minutes into the words an approver reads.
+//
+// "%d hour(s)" could not say fifteen minutes — it rounded to "0 hour(s)",
+// which reads as a request with no duration at all rather than the shortest
+// one the product offers.
+func HumanDuration(minutes int) string {
+	switch {
+	case minutes <= 0:
+		return "not specified"
+	case minutes < 60:
+		return fmt.Sprintf("%d minute(s)", minutes)
+	case minutes < 24*60:
+		h, m := minutes/60, minutes%60
+		if m == 0 {
+			return fmt.Sprintf("%d hour(s)", h)
+		}
+		return fmt.Sprintf("%dh %dm", h, m)
+	default:
+		d, h := minutes/(24*60), (minutes%(24*60))/60
+		if h == 0 {
+			return fmt.Sprintf("%d day(s)", d)
+		}
+		return fmt.Sprintf("%dd %dh", d, h)
+	}
 }

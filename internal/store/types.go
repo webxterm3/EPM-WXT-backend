@@ -918,6 +918,70 @@ type SessionRecording struct {
 	CreatedAt   time.Time          `bson:"created_at" json:"created_at"`
 }
 
+// AccessAsks is everything one request is asking for.
+//
+// A set of independent asks rather than one choice. Somebody diagnosing a
+// crash often needs to watch the screen AND install a debugger, and making
+// that two requests means two approvals, two audit entries, and two windows
+// that have to be made to overlap by hand.
+type AccessAsks struct {
+	RemoteSupport *RemoteSupportAsk `bson:"remote_support,omitempty" json:"remote_support,omitempty"`
+	AdminAccess   *AdminAccessAsk   `bson:"admin_access,omitempty" json:"admin_access,omitempty"`
+	AppInstall    *AppInstallAsk    `bson:"app_install,omitempty" json:"app_install,omitempty"`
+}
+
+// RemoteSupportAsk: see or drive the machine.
+type RemoteSupportAsk struct {
+	// Reason is what will happen in this session, in the requester's words.
+	Reason string `bson:"reason,omitempty" json:"reason,omitempty"`
+	// Control is how much of the machine: watching it, or driving it.
+	//
+	// The person whose desktop it is cares which one was given, and an
+	// approver handing out full control believing it was view-only is the
+	// mistake this field exists to prevent.
+	Control string `bson:"control,omitempty" json:"control,omitempty"`
+}
+
+// AdminAccessAsk: administrator rights on the machine.
+type AdminAccessAsk struct {
+	Reason string `bson:"reason,omitempty" json:"reason,omitempty"`
+}
+
+// AppInstallAsk: permission to install named software.
+type AppInstallAsk struct {
+	Reason string `bson:"reason,omitempty" json:"reason,omitempty"`
+	// Applications names what may be installed.
+	//
+	// Named rather than left open, because "may install software" and "may
+	// install Docker Desktop" are different grants, and only the second is
+	// one an approver can actually weigh.
+	Applications []string `bson:"applications,omitempty" json:"applications,omitempty"`
+}
+
+// Any reports whether this request asks for anything at all.
+func (a AccessAsks) Any() bool {
+	return a.RemoteSupport != nil || a.AdminAccess != nil || a.AppInstall != nil
+}
+
+// What an access request is asking for.
+const (
+	// AccessTypeRemoteSupport: somebody needs to see or drive the machine to
+	// fix something.
+	AccessTypeRemoteSupport = "remote_support"
+	// AccessTypeAdmin: administrator rights on the machine.
+	AccessTypeAdmin = "admin_access"
+	// AccessTypeInstall: permission to install one piece of software.
+	AccessTypeInstall = "application_installation"
+)
+
+// How much control an access request is asking for.
+const (
+	// AccessLevelView: watch the screen, drive nothing. Enough to diagnose.
+	AccessLevelView = "view_only"
+	// AccessLevelControl: full control of the desktop, over VNC or RDP.
+	AccessLevelControl = "full_control"
+)
+
 type AccessRequest struct {
 	ID                primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	MachineID         primitive.ObjectID `bson:"machine_id" json:"machine_id"`
@@ -929,18 +993,64 @@ type AccessRequest struct {
 	TenantID          string             `bson:"tenant_id" json:"tenant_id"`
 	OwnerID           string             `bson:"owner_id" json:"owner_id"`
 	OwnerEmail        string             `bson:"owner_email" json:"owner_email"` // for email notification
-	RequestNote       string             `bson:"request_note" json:"request_note"`
-	DurationHours     int                `bson:"duration_hours" json:"duration_hours"`
-	Status            string             `bson:"status" json:"status"` // "pending","approved","rejected","expired","revoked"
-	ApprovedBy        string             `bson:"approved_by,omitempty" json:"approved_by,omitempty"`
-	ApprovedAt        *time.Time         `bson:"approved_at,omitempty" json:"approved_at,omitempty"`
-	ExpiresAt         *time.Time         `bson:"expires_at,omitempty" json:"expires_at,omitempty"`
-	RejectedBy        string             `bson:"rejected_by,omitempty" json:"rejected_by,omitempty"`
-	RejectComment     string             `bson:"reject_comment,omitempty" json:"reject_comment,omitempty"`
-	RevokedBy         string             `bson:"revoked_by,omitempty" json:"revoked_by,omitempty"`
-	RevokedAt         *time.Time         `bson:"revoked_at,omitempty" json:"revoked_at,omitempty"`
-	RequestedAt       time.Time          `bson:"requested_at" json:"requested_at"`
-	UpdatedAt         time.Time          `bson:"updated_at" json:"updated_at"`
+	// Title is the one line an approver sees in a queue of them.
+	//
+	// RequestNote is the reasoning and can run to paragraphs; a list needs
+	// something short enough to scan. Without it the queue showed a machine
+	// name and a duration, and telling two requests apart meant opening both.
+	Title string `bson:"title,omitempty" json:"title,omitempty"`
+
+	RequestNote string `bson:"request_note" json:"request_note"`
+
+	// DurationHours is kept only to read requests stored before durations
+	// were counted in minutes. Nothing writes it any more; use Minutes().
+	DurationHours int `bson:"duration_hours,omitempty" json:"duration_hours,omitempty"`
+
+	// DurationMinutes is how long the grant lasts once approved.
+	//
+	// Minutes, because the product asks for fifteen-minute access and hours
+	// could not express it — anything under an hour rounded to zero, and zero
+	// meant NEVER EXPIRES. The shortest window on the list handed out
+	// permanent access, which is the exact opposite of what somebody picking
+	// it was asking for.
+	//
+	// Zero is no longer overloaded: it means "not set", and a request with no
+	// duration is refused rather than granted for ever.
+	DurationMinutes int `bson:"duration_minutes,omitempty" json:"duration_minutes,omitempty"`
+
+	// Asks is WHAT is being requested. One request can carry more than one.
+	//
+	// It was a single AccessType, which forced somebody who needed to watch a
+	// screen AND install something to raise two requests, or to pick one and
+	// explain the rest in the note — where no approver could act on it and no
+	// audit trail recorded it. Each ask carries its own reason, because "why
+	// do you need admin rights" and "why do you need to see the screen" have
+	// different answers and an approver weighs them separately.
+	Asks AccessAsks `bson:"asks,omitempty" json:"asks,omitempty"`
+
+	// AccessType and AccessLevel are read only for requests stored before
+	// Asks existed. Nothing writes them.
+	AccessType  string `bson:"access_type,omitempty" json:"access_type,omitempty"`
+	AccessLevel string `bson:"access_level,omitempty" json:"access_level,omitempty"`
+
+	// NotBefore and NotAfter are the window the session may run in.
+	//
+	// Distinct from the approval time: somebody can ask on Monday for a
+	// window on Saturday, and an approver deciding on Monday should not start
+	// the clock then. Both nil means "as soon as it is approved, for the
+	// duration asked for".
+	NotBefore     *time.Time `bson:"not_before,omitempty" json:"not_before,omitempty"`
+	NotAfter      *time.Time `bson:"not_after,omitempty" json:"not_after,omitempty"`
+	Status        string     `bson:"status" json:"status"` // "pending","approved","rejected","expired","revoked"
+	ApprovedBy    string     `bson:"approved_by,omitempty" json:"approved_by,omitempty"`
+	ApprovedAt    *time.Time `bson:"approved_at,omitempty" json:"approved_at,omitempty"`
+	ExpiresAt     *time.Time `bson:"expires_at,omitempty" json:"expires_at,omitempty"`
+	RejectedBy    string     `bson:"rejected_by,omitempty" json:"rejected_by,omitempty"`
+	RejectComment string     `bson:"reject_comment,omitempty" json:"reject_comment,omitempty"`
+	RevokedBy     string     `bson:"revoked_by,omitempty" json:"revoked_by,omitempty"`
+	RevokedAt     *time.Time `bson:"revoked_at,omitempty" json:"revoked_at,omitempty"`
+	RequestedAt   time.Time  `bson:"requested_at" json:"requested_at"`
+	UpdatedAt     time.Time  `bson:"updated_at" json:"updated_at"`
 }
 
 type Store interface {
@@ -1128,4 +1238,58 @@ type Store interface {
 
 	// Health / readiness
 	Ping(ctx context.Context) error
+}
+
+// Minutes is how long this grant lasts, whichever field it was stored in.
+//
+// Requests written before durations were counted in minutes carry hours, and
+// in that encoding zero meant NEVER EXPIRES. That meaning is preserved only
+// for those old rows — a new request with no duration is refused at the API,
+// not stored and granted for ever.
+func (a *AccessRequest) Minutes() int {
+	if a.DurationMinutes > 0 {
+		return a.DurationMinutes
+	}
+	return a.DurationHours * 60
+}
+
+// NeverExpires reports whether this is one of the old unbounded grants.
+//
+// Only true for a request stored in the hours encoding with a zero duration.
+// Nothing can create one now, and they are worth naming rather than leaving
+// as a silent property of the number zero.
+func (a *AccessRequest) NeverExpires() bool {
+	return a.DurationMinutes == 0 && a.DurationHours == 0
+}
+
+// DescribeAsks puts a request's asks into one line, for the audit trail.
+//
+// The audit entry has to say WHAT was approved. "approved an access request"
+// records that a decision happened and nothing about what was handed over,
+// which is the half that matters when somebody asks later who gave out
+// administrator rights.
+func DescribeAsks(a AccessAsks) string {
+	parts := make([]string, 0, 3)
+	if a.RemoteSupport != nil {
+		what := "remote support"
+		if a.RemoteSupport.Control == AccessLevelControl {
+			what += " (full control)"
+		} else {
+			what += " (view only)"
+		}
+		parts = append(parts, what)
+	}
+	if a.AdminAccess != nil {
+		parts = append(parts, "admin access")
+	}
+	if a.AppInstall != nil {
+		parts = append(parts,
+			"install: "+strings.Join(a.AppInstall.Applications, ", "))
+	}
+	if len(parts) == 0 {
+		// A request stored before asks existed. Named rather than left blank,
+		// because an empty field in an audit entry reads as a bug.
+		return "not recorded"
+	}
+	return strings.Join(parts, "; ")
 }
