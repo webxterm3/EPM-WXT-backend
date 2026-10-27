@@ -111,7 +111,17 @@ func (s *Simulator) Run(stream func(func(*store.InstalledApp) error) error) (Sim
 		// allow is the default outcome for almost everything, so it is counted
 		// but does not make a machine "affected" — otherwise every machine in
 		// the fleet is affected by every policy and the number means nothing.
-		if !d.Matched || d.Action == store.ActionAllow {
+		//
+		// The test is on the ACTION, not on whether a rule matched.
+		//
+		// It used to skip everything the catch-all decided, which made an
+		// allow-list policy — default block, rules as the exceptions —
+		// simulate as affecting nothing at all. That is the one policy shape
+		// whose blast radius somebody most needs to see before saving it:
+		// the applications it stops are precisely the ones no rule names, so
+		// counting only rule matches reports zero for a policy that is about
+		// to stop most of the fleet's software.
+		if d.Action == store.ActionAllow {
 			bucket := sim.ByAction[store.ActionAllow]
 			bucket.Installs++
 			sim.ByAction[store.ActionAllow] = bucket
@@ -133,9 +143,16 @@ func (s *Simulator) Run(stream func(func(*store.InstalledApp) error) error) (Sim
 		actionMachines[d.Action][app.AgentID] = true
 
 		if impacts[key] == nil {
+			// Named so the drill-down says WHY. A decision from the
+			// catch-all has no rule to name, and leaving that blank reads as
+			// missing data rather than as the answer.
+			why := d.RuleName
+			if !d.Matched {
+				why = "no rule — the policy default"
+			}
 			impacts[key] = &AppImpact{
 				Name: app.Name, Publisher: app.Publisher, Action: d.Action,
-				RuleName: d.RuleName, PolicyName: d.PolicyName,
+				RuleName: why, PolicyName: d.PolicyName,
 			}
 		}
 		impacts[key].MachineCount++

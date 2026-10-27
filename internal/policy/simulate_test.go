@@ -259,3 +259,39 @@ func TestASimulationThatProjectsElevationSaysNothingIsElevated(t *testing.T) {
 		}
 	})
 }
+
+// An allow-list policy must not simulate as affecting nothing.
+//
+// Default block, rules as the exceptions: the applications it stops are
+// precisely the ones no rule names. Counting only rule matches reported zero
+// for a policy that was about to stop most of the fleet's software — which
+// is the one policy shape whose blast radius somebody most needs to see
+// before saving it.
+func TestAnAllowListPolicyShowsWhatItWouldStop(t *testing.T) {
+	p := policy("allow-list", store.PolicyScopeTenant, 0,
+		rule("Slack is allowed", store.ActionAllow, store.MatchCriteria{AppName: equals("Slack")}))
+	p.DefaultAction = store.ActionBlock
+	p.Mode = store.ModeEnforce
+
+	m := machine()
+	sim, err := simulatorFor(p, m).Run(streamOf(
+		install(m.AgentID, m.Name, "Slack", "Slack Technologies"),
+		install(m.AgentID, m.Name, "qBittorrent", "The qBittorrent project"),
+		install(m.AgentID, m.Name, "Transmission", "Transmission"),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if sim.Summary.InstallsMatched != 2 {
+		t.Errorf("the policy would stop 2 applications, the simulation says %d — "+
+			"an allow-list policy reporting zero is how somebody saves one "+
+			"believing it does nothing", sim.Summary.InstallsMatched)
+	}
+	if got := sim.ByAction[store.ActionBlock].Installs; got != 2 {
+		t.Errorf("block bucket counted %d", got)
+	}
+	if got := sim.ByAction[store.ActionAllow].Installs; got != 1 {
+		t.Errorf("allow bucket counted %d, wanted the one rule match", got)
+	}
+}

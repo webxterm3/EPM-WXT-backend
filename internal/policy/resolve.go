@@ -3,6 +3,7 @@ package policy
 import (
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/vsay/vsay-agent-backend/internal/store"
 )
@@ -50,6 +51,65 @@ type Effective struct {
 	Rules         []EffectiveRule `json:"rules"`
 	Sources       []Source        `json:"sources"`
 	Conflicts     []Conflict      `json:"conflicts,omitempty"`
+
+	// ApprovedInstalls are one-off exceptions an administrator granted,
+	// usually in answer to a request raised from the machine itself.
+	//
+	// Carried BESIDE the rules rather than folded into them, for two
+	// reasons. Resolve stays pure — it is called by the portal's simulation
+	// as well as by the push, and a simulation that invented exceptions
+	// would report a fleet nobody has. And an agent that predates this field
+	// ignores it and keeps blocking, which is the direction a version
+	// mismatch has to fail in: the other way round, an old agent would see a
+	// rule it half-understood and allow something indefinitely.
+	ApprovedInstalls []ApprovedInstall `json:"approved_installs,omitempty"`
+}
+
+// ApprovedInstall is permission for one application, until one moment.
+type ApprovedInstall struct {
+	// Application is the name the endpoint reported when it was refused, so
+	// the exception matches the thing that was actually asked about.
+	Application string `json:"application"`
+	// BundleID narrows it where the endpoint knew one. An exception that
+	// matched on name alone could be claimed by anything named the same.
+	BundleID string `json:"bundle_id,omitempty"`
+	// Publisher is who signed the application that was refused. An
+	// unsigned lookalike must not inherit somebody else's approval.
+	Publisher string `json:"publisher,omitempty"`
+	// Until is when it lapses. An approval with no end is a policy change
+	// made by whoever clicked once.
+	Until time.Time `json:"until"`
+
+	// InstallPath is where the application lives once installed, as the
+	// endpoint reported it.
+	//
+	// Carried because a rule matching on a path cannot be evaluated without
+	// one: matchPath returns false when the subject has no path at all, so
+	// every such rule silently failed to match in the portal while matching
+	// perfectly well on the machine.
+	InstallPath string `json:"install_path,omitempty"`
+
+	// Operation is what was approved: install, update or remove. Empty
+	// means install, so an agent that predates the field reads every
+	// approval exactly as it read them before.
+	//
+	// A NEW field, which is the direction a version mismatch has to fail
+	// in: an old agent ignores it and treats a remove-only approval as the
+	// install approval it already understood. That is the same shape as
+	// ApprovedInstalls itself, and for the same reason.
+	Operation string `json:"operation,omitempty"`
+
+	// Spent marks an approval that has already been used: the software it
+	// covers was installed and the endpoint said so.
+	//
+	// A spent approval no longer permits INSTALLING — somebody who uninstalls
+	// the software and wants it back asks again, because the approver agreed
+	// to one install and not to a standing permission for the rest of the
+	// day. It does still EXEMPT what is on the machine from enforcement,
+	// which is a different question: the software is there because it was
+	// approved, and withdrawing that would have the agent quarantine the
+	// very thing it had just been told to install.
+	Spent bool `json:"spent,omitempty"`
 }
 
 // Source is one policy that contributed, in the order it contributed.

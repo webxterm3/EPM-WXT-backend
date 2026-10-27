@@ -358,13 +358,23 @@ func preparePolicy(p store.AppPolicy, tenantID, actor string) (*store.AppPolicy,
 	if p.Mode != store.ModeEnforce {
 		p.Mode = store.ModeAudit
 	}
-	// Removal only means anything for a policy that blocks something, and a
-	// default-deny policy must not be able to reach it: the rules in such a
-	// policy are the ALLOW list, so nothing a rule matched is blocked, and
-	// everything else would be swept off the machine by the catch-all.
-	if p.DefaultAction == store.ActionBlock {
-		p.RemoveBlocked = false
-	}
+	// Removal is NOT forced off for a default-deny policy any more.
+	//
+	// It used to be, on the reasoning that such a policy's rules are the
+	// ALLOW list, so everything else would be swept off the machine by the
+	// catch-all. The catch-all cannot reach removal: the agent sets Remove
+	// only on a decision that came from a RULE — see Evaluate, where a rule
+	// match carries `Remove: er.RemoveBlocked && action == ActionBlock &&
+	// fromRule` and the catch-all returns a Decision with Remove left false.
+	// So the protection is structural, and forcing the switch off here only
+	// took removal away from the explicit block rules in the same policy.
+	//
+	// That is what made default-deny useless in practice. Somebody would set
+	// the default to block, write a rule blocking an application, and find
+	// it still sitting in the Applications folder: without removal a block
+	// on macOS is an execute-bit change inside the bundle, which macOS 14
+	// refuses without App Management, leaving the application installed and
+	// merely closed when it is opened.
 
 	if p.DefaultAction != store.ActionBlock {
 		// Anything other than an explicit block defaults to allow. A policy

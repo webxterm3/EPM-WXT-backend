@@ -175,3 +175,55 @@ func TestAnEmptyIdentityNeverMatches(t *testing.T) {
 		t.Error("an old request with no recorded requester blocked its own machine's owner")
 	}
 }
+
+// A request raised from an endpoint carries no RequesterID.
+//
+// The machine knows which OS account is logged in; the portal knows people
+// with accounts, and those namespaces do not reliably map — so the id is left
+// empty rather than guessed, because a wrong one would attribute somebody
+// else's request.
+//
+// With only the id check, an administrator whose portal account shares a name
+// with their Mac account could raise a request from their laptop and approve
+// it themselves, which is the one thing an approval workflow exists to stop.
+func TestAnEndpointRequestCannotBeSelfApprovedEither(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest("POST", "/", nil)
+	c.Set("user_id", primitive.NewObjectID().Hex())
+	c.Set("username", "yesveer")
+	c.Set("role", "company_admin")
+	c.Set("tenant_id", "t1")
+
+	// Raised from the machine: a username, no id.
+	ar := &store.AccessRequest{RequesterID: "", RequesterUsername: "yesveer"}
+	machine := &store.Machine{TenantID: "t1", OwnerID: primitive.NewObjectID()}
+
+	if handlerForDecisions().mayDecide(c, ar, machine) {
+		t.Fatal("an administrator approved a request raised from their own machine")
+	}
+	if rec.Code != 403 {
+		t.Errorf("refused with %d, want 403", rec.Code)
+	}
+}
+
+// Somebody else's endpoint request is still decidable — the check must
+// narrow, not block everything with no id.
+func TestAnEndpointRequestFromSomebodyElseIsStillDecidable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest("POST", "/", nil)
+	c.Set("user_id", primitive.NewObjectID().Hex())
+	c.Set("username", "someone-else")
+	c.Set("role", "company_admin")
+	c.Set("tenant_id", "t1")
+
+	ar := &store.AccessRequest{RequesterUsername: "yesveer"}
+	machine := &store.Machine{TenantID: "t1", OwnerID: primitive.NewObjectID()}
+
+	if !handlerForDecisions().mayDecide(c, ar, machine) {
+		t.Error("an administrator was blocked from deciding somebody else's request")
+	}
+}

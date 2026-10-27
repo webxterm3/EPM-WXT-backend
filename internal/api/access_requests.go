@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/vsay/vsay-agent-backend/internal/approvers"
 	emailsvc "github.com/vsay/vsay-agent-backend/internal/email"
+	"github.com/vsay/vsay-agent-backend/internal/policy"
 	"github.com/vsay/vsay-agent-backend/internal/store"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -23,9 +24,19 @@ import (
 var validAccessRequestStatuses = map[string]bool{
 	"pending":  true,
 	"approved": true, // "Active" tab — approved and not yet expired/revoked
-	"expired":  true, // "Approved & Completed" tab — ran its full granted duration
+	"expired":  true, // ran its full granted duration
 	"rejected": true,
 	"revoked":  true, // manually revoked by an admin while still active
+
+	// "completed" — the thing that was approved has been DONE.
+	//
+	// Only an install request ever reaches it, and only when the endpoint
+	// says the software went on. An install is not a session: it either
+	// happened or it did not, and leaving it sitting in "Active" for the
+	// rest of its 24-hour window told an approver nothing about which.
+	// "expired" was the nearest existing state and means something else —
+	// that the clock ran out, which is exactly the case this distinguishes.
+	"completed": true,
 }
 
 // emailService is a package-level stateless email service instance.
@@ -298,7 +309,8 @@ func (h *Handler) GetMyAccessRequests(c *gin.Context) {
 	requesterID := c.GetString("user_id")
 	tenantID := c.GetString("tenant_id")
 
-	requests, err := h.store.GetAccessRequestsByRequester(requesterID, tenantID)
+	requests, err := h.store.GetAccessRequestsByRequester(
+		requesterID, c.GetString("email"), tenantID)
 	if err != nil {
 		h.logger.Error("Failed to get access requests", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get access requests"})
@@ -411,9 +423,48 @@ func (h *Handler) ApproveAccessRequest(c *gin.Context) {
 		return
 	}
 
+	// Refuse to approve what the endpoint will not honour.
+	//
+	// A rule that blocks an application beats any approval on the machine —
+	// a standing rule is a decision about every endpoint, an approval is one
+	// person's answer to one ask. So recording an approval here would record
+	// one that cannot take effect: the approver clicks yes, nothing happens
+	// on the Mac, and the product looks broken rather than the policy
+	// looking deliberate.
+	//
+	// Said plainly, with the way out, because the way out is a policy change
+	// and that is not something an approver can guess.
+	if blocked, rule := h.blockedByPolicy(ar); blocked {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "Your organisation blocks this application, under the rule \"" +
+				rule + "\". It cannot be approved from here, because the endpoint " +
+				"will refuse it however this request is answered. To allow it, an " +
+				"administrator has to change or remove that rule in the policy.",
+			"blocked_by_rule": rule,
+		})
+		return
+	}
+
 	now := time.Now()
 
+	// "approved" is a session that is running; an install is not one.
+	//
+	// A request to install software is finished for the approver the moment
+	// they decide — there is no window to watch, nothing to revoke mid-way,
+	// and nobody to cut off. Leaving it in Active meant an administrator's
+	// queue filled with rows that would sit there for a day and then turn
+	// into "expired", which reads as nobody having dealt with them.
+	//
+	// The permission still reaches the machine: the live-approvals query
+	// reads approved AND completed, and what ends it is UsedAt or the
+	// expiry, not the status.
+	//
+	// Only when installing is ALL it asks for. A request that also asks for
+	// remote support has a session to run, and that one is genuinely active.
 	ar.Status = "approved"
+	if installOnly(ar.Asks) {
+		ar.Status = "completed"
+	}
 	ar.ApprovedBy = approverUsername
 	ar.ApprovedAt = &now
 
@@ -454,11 +505,34 @@ func (h *Handler) ApproveAccessRequest(c *gin.Context) {
 		return
 	}
 
-	// Grant machine access
-	if err := h.store.GrantMachineAccess(ar.MachineID, ar.RequesterUsername); err != nil {
-		h.logger.Error("Failed to grant machine access", zap.Error(err))
-		// Non-fatal — request is marked approved, access grant can be retried
+	// Grant machine access — but only where that is what was asked for.
+	//
+	// This used to run for EVERY approval, and machine.AllowedUsers is the
+	// remote-access list: api/terminal.go checks it to decide who may open a
+	// session on a machine. So approving "let me install Visual Studio Code"
+	// also handed that person remote access to the Mac, which nobody asked
+	// for and no approver saw.
+	//
+	// Worse on an endpoint-raised request, where RequesterUsername is the
+	// macOS console account rather than a portal user: a Unix account name
+	// was being written into a portal authorisation list, where it would
+	// match any portal user who happened to share the name.
+	if ar.Asks.GrantsMachineAccess() {
+		if err := h.store.GrantMachineAccess(ar.MachineID, ar.RequesterUsername); err != nil {
+			h.logger.Error("Failed to grant machine access", zap.Error(err))
+			// Non-fatal — request is marked approved, access grant can be retried
+		}
 	}
+
+	// Tell the machine, now.
+	//
+	// An approval for software is a change to what that endpoint is allowed
+	// to install, and until the endpoint has been told, nothing about it has
+	// changed there. Approving used to push nothing at all: the portal said
+	// approved, and the Mac went on refusing the software until somebody
+	// happened to edit a policy — which is what triggered the only sweep
+	// that carried exceptions.
+	h.pushInstallApprovals(ar)
 
 	// Send approval email (best-effort, async)
 	if ar.RequesterEmail != "" {
@@ -484,6 +558,129 @@ func (h *Handler) ApproveAccessRequest(c *gin.Context) {
 		},
 	})
 	c.JSON(http.StatusOK, gin.H{"message": "access request approved", "request": ar})
+}
+
+// markBlockedByPolicy annotates a page of requests with the rule forbidding
+// each, where one does.
+//
+// The policies are read ONCE for the page rather than once per row: a page
+// is twenty-five requests and the answer is the same for all of them.
+func (h *Handler) markBlockedByPolicy(tenantID string, reqs []*store.AccessRequest) {
+	if tenantID == "" || len(reqs) == 0 {
+		return
+	}
+	policies, err := h.store.GetAppPoliciesByTenant(tenantID)
+	if err != nil {
+		h.logger.Warn("could not read policies to mark blocked requests",
+			zap.String("tenant_id", tenantID), zap.Error(err))
+		return
+	}
+
+	for _, ar := range reqs {
+		if ar == nil || ar.Asks.AppInstall == nil {
+			continue
+		}
+		for _, app := range ar.Asks.AppInstall.Applications {
+			exception := policy.ApprovedInstall{
+				Application: app,
+				Publisher:   ar.Asks.AppInstall.Publisher,
+				BundleID:    ar.Asks.AppInstall.BundleID,
+				InstallPath: ar.Asks.AppInstall.InstallPath,
+			}
+			if policy.BlockedByRule(policies, exception) {
+				ar.BlockedByRule = ruleForbidding(policies, exception)
+				break
+			}
+		}
+	}
+}
+
+// installOnly reports whether installing software is the whole of what this
+// request asks for.
+func installOnly(a store.AccessAsks) bool {
+	return a.AppInstall != nil && a.RemoteSupport == nil && a.AdminAccess == nil
+}
+
+// blockedByPolicy reports whether a rule forbids the software this request
+// asks for, and names the rule.
+//
+// Only an install ask can be blocked this way; remote support and admin
+// access are not application policy.
+func (h *Handler) blockedByPolicy(ar *store.AccessRequest) (bool, string) {
+	if ar.Asks.AppInstall == nil || len(ar.Asks.AppInstall.Applications) == 0 {
+		return false, ""
+	}
+
+	policies, err := h.store.GetAppPoliciesByTenant(ar.TenantID)
+	if err != nil {
+		// Unknown rather than blocked. Refusing an approval because the
+		// policy store could not be read would stop somebody doing their
+		// job over a database blip, and the endpoint still refuses the
+		// software either way.
+		h.logger.Warn("could not read policies to check an approval",
+			zap.String("tenant_id", ar.TenantID), zap.Error(err))
+		return false, ""
+	}
+
+	for _, app := range ar.Asks.AppInstall.Applications {
+		exception := policy.ApprovedInstall{
+			Application: app,
+			Publisher:   ar.Asks.AppInstall.Publisher,
+			BundleID:    ar.Asks.AppInstall.BundleID,
+			InstallPath: ar.Asks.AppInstall.InstallPath,
+		}
+		if policy.BlockedByRule(policies, exception) {
+			return true, ruleForbidding(policies, exception)
+		}
+	}
+	return false, ""
+}
+
+// ruleForbidding names the rule, so the message can say which one to change.
+func ruleForbidding(policies []*store.AppPolicy, app policy.ApprovedInstall) string {
+	for _, p := range policies {
+		if p == nil || !p.Enabled {
+			continue
+		}
+		for _, r := range p.Rules {
+			if !r.Enabled || r.Action != store.ActionBlock {
+				continue
+			}
+			if policy.BlockedByRule([]*store.AppPolicy{{
+				Enabled: true, Rules: []store.PolicyRule{r},
+			}}, app) {
+				return r.Name
+			}
+		}
+	}
+	return "a block rule"
+}
+
+// pushInstallApprovals re-sends one machine's policy after a decision about
+// software it may install.
+//
+// Only for requests that actually carry an install ask — approving remote
+// support changes nothing the agent's application policy depends on, and a
+// push per decision would be a round trip bought for nothing.
+//
+// Best effort, and deliberately not fatal to the decision: the decision is
+// recorded, and an endpoint that was offline or unreachable picks the same
+// exception up on its next connect, which goes through the same resolver.
+func (h *Handler) pushInstallApprovals(ar *store.AccessRequest) {
+	if ar.Asks.AppInstall == nil || h.policyPusher == nil {
+		return
+	}
+
+	machine, err := h.store.GetMachineByID(ar.MachineID)
+	if err != nil || machine == nil {
+		h.logger.Warn("could not reach the machine to deliver an install decision",
+			zap.String("request_id", ar.ID.Hex()), zap.Error(err))
+		return
+	}
+	if err := h.policyPusher.PushTo(machine); err != nil {
+		h.logger.Warn("could not deliver an install decision to the machine",
+			zap.String("machine", machine.Name), zap.Error(err))
+	}
 }
 
 // POST /api/access-requests/:id/reject
@@ -609,6 +806,10 @@ func (h *Handler) ListAccessRequests(c *gin.Context) {
 		return
 	}
 
+	// Marked before the list goes out, so an approver sees which of these
+	// cannot be approved without having to click one to find out.
+	h.markBlockedByPolicy(filterTenantID, reqs)
+
 	totalPages := int(math.Ceil(float64(total) / float64(limit)))
 	if totalPages < 1 {
 		totalPages = 1
@@ -672,9 +873,14 @@ func (h *Handler) RevokeAccessRequest(c *gin.Context) {
 	ar.RevokedBy = revokerUsername
 	ar.RevokedAt = &now
 
-	if err := h.store.RevokeMachineAccess(ar.MachineID, ar.RequesterUsername); err != nil {
-		h.logger.Error("Failed to revoke machine access", zap.Error(err))
-		// Non-fatal — the request is still marked revoked below
+	// Guarded the same way the grant is. Revoking for an install-only
+	// request would take away access somebody holds from a different
+	// request that is still live.
+	if ar.Asks.GrantsMachineAccess() {
+		if err := h.store.RevokeMachineAccess(ar.MachineID, ar.RequesterUsername); err != nil {
+			h.logger.Error("Failed to revoke machine access", zap.Error(err))
+			// Non-fatal — the request is still marked revoked below
+		}
 	}
 
 	if err := h.store.UpdateAccessRequest(ar); err != nil {
@@ -703,6 +909,11 @@ func (h *Handler) RevokeAccessRequest(c *gin.Context) {
 			"revoked":   true,
 		},
 	})
+	// Withdrawing it from the machine matters more than granting it did: an
+	// exception that outlives its revocation is a permission nobody believes
+	// is still in force.
+	h.pushInstallApprovals(ar)
+
 	c.JSON(http.StatusOK, gin.H{"message": "access request revoked", "request": ar})
 }
 
@@ -742,10 +953,20 @@ func (h *Handler) mayDecide(c *gin.Context, ar *store.AccessRequest, machine *st
 
 	// Nobody decides their own request, whatever else they are.
 	//
-	// Compared on the requester's user id rather than their username: a
-	// username can be changed, and an approval gate that turns on a display
-	// name is one rename away from opening.
-	if ar.RequesterID != "" && ar.RequesterID == userID {
+	// The id is the reliable comparison — a username can be changed, and a
+	// gate that turns on a display name is one rename away from opening.
+	//
+	// The username is compared AS WELL, for requests raised from an endpoint.
+	// Those carry no RequesterID: the machine knows which OS account is
+	// logged in, the portal knows people with accounts, and those namespaces
+	// do not reliably map, so guessing an id would attribute somebody else's
+	// request. With only the id check, an administrator whose portal account
+	// happens to share a name with their Mac account could approve their own.
+	self := ar.RequesterID != "" && ar.RequesterID == userID
+	if !self && ar.RequesterUsername != "" {
+		self = strings.EqualFold(ar.RequesterUsername, c.GetString("username"))
+	}
+	if self {
 		c.JSON(http.StatusForbidden, gin.H{
 			"error": "You cannot decide your own access request. Someone else has to.",
 		})

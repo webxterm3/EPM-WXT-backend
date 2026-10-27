@@ -1709,11 +1709,35 @@ func (m *MongoDB) GetAccessRequestsByMachine(machineID primitive.ObjectID) ([]*A
 	return reqs, cursor.All(ctx, &reqs)
 }
 
-func (m *MongoDB) GetAccessRequestsByRequester(requesterID, tenantID string) ([]*AccessRequest, error) {
+func (m *MongoDB) GetAccessRequestsByRequester(requesterID, requesterEmail, tenantID string) ([]*AccessRequest, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	filter := bson.M{"requester_id": requesterID, "tenant_id": tenantID}
+	// Matched on either identity, because requests do not all carry both.
+	//
+	// A request raised from an endpoint has no portal user id: the Mac knows
+	// who is logged into it, the portal knows people with accounts, and
+	// those are different namespaces that the agent deliberately does not
+	// guess between. Keyed on the id alone, somebody's own install request
+	// could never appear in their own list — they asked for software, were
+	// told the request had been made, and then found nothing anywhere.
+	//
+	// Each clause is added only when it has a value. An empty one would
+	// match every request that also lacks it, which is every endpoint-raised
+	// request in the tenant.
+	var identity []bson.M
+	if requesterID != "" {
+		identity = append(identity, bson.M{"requester_id": requesterID})
+	}
+	if requesterEmail != "" {
+		identity = append(identity, bson.M{"requester_email": bson.M{
+			"$regex": "^" + regexp.QuoteMeta(requesterEmail) + "$", "$options": "i"}})
+	}
+	if len(identity) == 0 {
+		return nil, nil
+	}
+
+	filter := bson.M{"tenant_id": tenantID, "$or": identity}
 	opts := options.Find().SetSort(bson.D{{Key: "requested_at", Value: -1}})
 	cursor, err := m.AccessRequests.Find(ctx, filter, opts)
 	if err != nil {
@@ -1783,6 +1807,94 @@ func (m *MongoDB) GetAccessRequestsFiltered(tenantID, status, search string, lim
 		return nil, 0, err
 	}
 	return reqs, total, nil
+}
+
+// ApprovedInstallRequest finds the live approval covering one application.
+//
+// Anchored on the exact name, for the same reason the duplicate check is:
+// unanchored, finishing "Docker" would close the request for "Docker
+// Desktop".
+func (m *MongoDB) ApprovedInstallRequest(agentID, application string) (*AccessRequest, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	name := primitive.Regex{Pattern: "^" + regexp.QuoteMeta(application) + "$", Options: "i"}
+	var ar AccessRequest
+	// Approved OR completed, and not already used.
+	//
+	// An install request reaches a terminal status the moment it is decided,
+	// because there is nothing left for the approver to do — so looking only
+	// for "approved" would never find the request this is reporting on.
+	err := m.AccessRequests.FindOne(ctx, bson.M{
+		"status":                        bson.M{"$in": []string{"approved", "completed"}},
+		"machine_agent_id":              agentID,
+		"asks.app_install.applications": name,
+		"used_at":                       bson.M{"$exists": false},
+	}).Decode(&ar)
+	if err == mongo.ErrNoDocuments {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &ar, nil
+}
+
+// ApprovedInstallsForMachine filters in the database on the machine, so no
+// other machine's approvals can crowd this one's out of a page.
+func (m *MongoDB) ApprovedInstallsForMachine(agentID string) ([]*AccessRequest, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// "completed" counts as live, not spent.
+	//
+	// Completing the request records that the software went on; it does not
+	// withdraw the permission. Reading only "approved" meant the exception
+	// vanished the instant the endpoint reported success — and the agent's
+	// enforcement pass, which consults the same list, then saw a bundle no
+	// exception covered and quarantined back off the machine the very thing
+	// it had just installed. The approval ends when ExpiresAt says so, which
+	// approvedInstallsFor still checks.
+	cursor, err := m.AccessRequests.Find(ctx, bson.M{
+		"status":           bson.M{"$in": []string{"approved", "completed"}},
+		"machine_agent_id": agentID,
+		"asks.app_install": bson.M{"$exists": true},
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var reqs []*AccessRequest
+	if err := cursor.All(ctx, &reqs); err != nil {
+		return nil, err
+	}
+	return reqs, nil
+}
+
+// HasPendingInstallRequest matches on the fields that identify the ask: the
+// machine and the named application, exactly rather than as a substring.
+//
+// Mongo applies a scalar or regex match to each element of an array field, so
+// comparing against applications tests every name the request carries.
+func (m *MongoDB) HasPendingInstallRequest(agentID, application string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Anchored, and case-insensitive the same way the endpoint compares
+	// names. Unanchored, a pending request for "Docker Desktop" would
+	// suppress a later one for "Docker".
+	name := primitive.Regex{Pattern: "^" + regexp.QuoteMeta(application) + "$", Options: "i"}
+
+	n, err := m.AccessRequests.CountDocuments(ctx, bson.M{
+		"status":                        "pending",
+		"machine_agent_id":              agentID,
+		"asks.app_install.applications": name,
+	}, options.Count().SetLimit(1))
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func (m *MongoDB) GetExpiredAccessRequests() ([]*AccessRequest, error) {

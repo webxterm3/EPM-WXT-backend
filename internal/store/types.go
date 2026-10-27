@@ -918,6 +918,15 @@ type SessionRecording struct {
 	CreatedAt   time.Time          `bson:"created_at" json:"created_at"`
 }
 
+// Where a request came from.
+const (
+	// SourceEndpoint: a machine raised it, because somebody opened an
+	// installer the policy would not allow.
+	SourceEndpoint = "endpoint"
+	// SourcePortal: somebody typed it into the portal.
+	SourcePortal = "portal"
+)
+
 // AccessAsks is everything one request is asking for.
 //
 // A set of independent asks rather than one choice. Somebody diagnosing a
@@ -956,6 +965,81 @@ type AppInstallAsk struct {
 	// install Docker Desktop" are different grants, and only the second is
 	// one an approver can actually weigh.
 	Applications []string `bson:"applications,omitempty" json:"applications,omitempty"`
+
+	// Publisher and BundleID narrow a request raised from an endpoint, where
+	// the agent read them off the bundle it refused.
+	//
+	// They are what stops an approval being inherited. With only a name, an
+	// approval for "Claude" is claimable by anything whose folder is called
+	// Claude.app — and an image's contents are whatever its author put there.
+	// Empty on a request somebody typed in the portal, where there is no
+	// bundle to read them from.
+	Publisher string `bson:"publisher,omitempty" json:"publisher,omitempty"`
+	BundleID  string `bson:"bundle_id,omitempty" json:"bundle_id,omitempty"`
+
+	// Operation is what is being asked for: installing, updating or
+	// removing. Empty means install, so every request stored before this
+	// field existed keeps exactly the meaning it was approved with.
+	//
+	// It lives on the ASK, not on the policy rule. A rule says whether an
+	// application is allowed at all; it has never had an opinion about
+	// install versus uninstall, and giving it one would mean a new axis in
+	// the editor, the simulation and the matcher for a distinction nobody
+	// writing a policy has asked to draw. What people do ask for is
+	// permission to do one specific thing once, and that is a request.
+	//
+	// An approver has to see the verb. "Approve Docker Desktop" means
+	// something different depending on whether the person is putting it on
+	// the machine or taking it off, and approving the wrong one is not a
+	// mistake they can see.
+	Operation string `bson:"operation,omitempty" json:"operation,omitempty"`
+
+	// InstallPath is where the application would live once installed, as
+	// the endpoint reported it.
+	//
+	// Without it a rule that matches on a path cannot be evaluated here at
+	// all — matchPath needs a path and has nothing to compare against — so
+	// every such rule silently failed to match and an approver was never
+	// warned about software their own policy forbids.
+	InstallPath string `bson:"install_path,omitempty" json:"install_path,omitempty"`
+}
+
+// What an install ask is asking to do.
+const (
+	// OpInstall is the default, and what an empty Operation means.
+	OpInstall = "install"
+	OpUpdate  = "update"
+	OpRemove  = "remove"
+)
+
+// InstallOperation is the ask's operation, with the empty default resolved.
+func (a *AppInstallAsk) InstallOperation() string {
+	if a == nil || a.Operation == "" {
+		return OpInstall
+	}
+	return a.Operation
+}
+
+// GrantsMachineAccess reports whether approving this request should add the
+// requester to the machine's remote-access list — and, symmetrically,
+// whether letting it lapse should take them off it.
+//
+// Permission to install software is not permission to connect to somebody's
+// desktop. An install-only request changes exactly one thing: the policy
+// exception delivered to the endpoint.
+//
+// The symmetry matters as much as the rule. Narrowing the grant without
+// narrowing the revoke would have an expiring install request strip access
+// somebody holds from a DIFFERENT request that is still live.
+//
+// A request carrying no asks at all predates the asks field, when every
+// request WAS a remote-access request. Those keep their old meaning:
+// re-interpreting a stored grant is a decision for whoever made it.
+func (a AccessAsks) GrantsMachineAccess() bool {
+	if !a.Any() {
+		return true
+	}
+	return a.RemoteSupport != nil || a.AdminAccess != nil
 }
 
 // Any reports whether this request asks for anything at all.
@@ -983,16 +1067,35 @@ const (
 )
 
 type AccessRequest struct {
-	ID                primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	MachineID         primitive.ObjectID `bson:"machine_id" json:"machine_id"`
-	MachineName       string             `bson:"machine_name" json:"machine_name"`
-	MachineAgentID    string             `bson:"machine_agent_id" json:"machine_agent_id"`
-	RequesterID       string             `bson:"requester_id" json:"requester_id"`
-	RequesterUsername string             `bson:"requester_username" json:"requester_username"`
-	RequesterEmail    string             `bson:"requester_email" json:"requester_email"`
-	TenantID          string             `bson:"tenant_id" json:"tenant_id"`
-	OwnerID           string             `bson:"owner_id" json:"owner_id"`
-	OwnerEmail        string             `bson:"owner_email" json:"owner_email"` // for email notification
+	ID             primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	MachineID      primitive.ObjectID `bson:"machine_id" json:"machine_id"`
+	MachineName    string             `bson:"machine_name" json:"machine_name"`
+	MachineAgentID string             `bson:"machine_agent_id" json:"machine_agent_id"`
+	// Source is where the request came from: "endpoint" when a machine
+	// raised it, "portal" when somebody typed it in.
+	//
+	// Nothing could tell the two apart before, and they are not the same
+	// kind of thing. An endpoint request carries no portal user id, is
+	// about one specific signed bundle, and finishes when the software is
+	// installed rather than when a clock runs out.
+	Source string `bson:"source,omitempty" json:"source,omitempty"`
+
+	// BlockedByRule names a policy rule that forbids the software this
+	// request asks for. Never stored — filled in when a list is built, from
+	// the policy as it stands at that moment.
+	//
+	// It exists so an approver can see the answer BEFORE clicking. The
+	// approve call refuses one of these, but by then they have already
+	// decided and been told no, which reads as the product arguing with
+	// them rather than as the policy being deliberate.
+	BlockedByRule string `bson:"-" json:"blocked_by_rule,omitempty"`
+
+	RequesterID       string `bson:"requester_id" json:"requester_id"`
+	RequesterUsername string `bson:"requester_username" json:"requester_username"`
+	RequesterEmail    string `bson:"requester_email" json:"requester_email"`
+	TenantID          string `bson:"tenant_id" json:"tenant_id"`
+	OwnerID           string `bson:"owner_id" json:"owner_id"`
+	OwnerEmail        string `bson:"owner_email" json:"owner_email"` // for email notification
 	// Title is the one line an approver sees in a queue of them.
 	//
 	// RequestNote is the reasoning and can run to paragraphs; a list needs
@@ -1039,11 +1142,22 @@ type AccessRequest struct {
 	// window on Saturday, and an approver deciding on Monday should not start
 	// the clock then. Both nil means "as soon as it is approved, for the
 	// duration asked for".
-	NotBefore     *time.Time `bson:"not_before,omitempty" json:"not_before,omitempty"`
-	NotAfter      *time.Time `bson:"not_after,omitempty" json:"not_after,omitempty"`
-	Status        string     `bson:"status" json:"status"` // "pending","approved","rejected","expired","revoked"
-	ApprovedBy    string     `bson:"approved_by,omitempty" json:"approved_by,omitempty"`
-	ApprovedAt    *time.Time `bson:"approved_at,omitempty" json:"approved_at,omitempty"`
+	NotBefore  *time.Time `bson:"not_before,omitempty" json:"not_before,omitempty"`
+	NotAfter   *time.Time `bson:"not_after,omitempty" json:"not_after,omitempty"`
+	Status     string     `bson:"status" json:"status"` // "pending","approved","rejected","expired","revoked"
+	ApprovedBy string     `bson:"approved_by,omitempty" json:"approved_by,omitempty"`
+	ApprovedAt *time.Time `bson:"approved_at,omitempty" json:"approved_at,omitempty"`
+
+	// UsedAt is when the endpoint reported that it had done the thing this
+	// request asked for.
+	//
+	// Its own fact, not a reading of the status. The status tracks what the
+	// APPROVER has left to do — and for an install request that is nothing,
+	// the moment they decide — while this tracks whether the permission has
+	// been spent. Deriving one from the other forced a choice between an
+	// approval that sat in "Active" for a day with nobody able to act on it,
+	// and one that was spent before the software was ever installed.
+	UsedAt        *time.Time `bson:"used_at,omitempty" json:"used_at,omitempty"`
 	ExpiresAt     *time.Time `bson:"expires_at,omitempty" json:"expires_at,omitempty"`
 	RejectedBy    string     `bson:"rejected_by,omitempty" json:"rejected_by,omitempty"`
 	RejectComment string     `bson:"reject_comment,omitempty" json:"reject_comment,omitempty"`
@@ -1170,7 +1284,10 @@ type Store interface {
 	// Access requests
 	CreateAccessRequest(req *AccessRequest) error
 	GetAccessRequestsByMachine(machineID primitive.ObjectID) ([]*AccessRequest, error)
-	GetAccessRequestsByRequester(requesterID, tenantID string) ([]*AccessRequest, error)
+	// GetAccessRequestsByRequester is one person's own requests, matched on
+	// their portal id OR the address they are known by — a request raised
+	// from an endpoint carries only the latter.
+	GetAccessRequestsByRequester(requesterID, requesterEmail, tenantID string) ([]*AccessRequest, error)
 	GetAccessRequestByID(id primitive.ObjectID) (*AccessRequest, error)
 	UpdateAccessRequest(req *AccessRequest) error
 	GetExpiredAccessRequests() ([]*AccessRequest, error)
@@ -1178,6 +1295,32 @@ type Store interface {
 	// status tab at a time (pending/approved/expired/rejected/revoked), optionally
 	// scoped to a tenant and text-searched across requester/machine fields.
 	GetAccessRequestsFiltered(tenantID, status, search string, limit, skip int) ([]*AccessRequest, int64, error)
+
+	// ApprovedInstallRequest is the live approval for ONE application on one
+	// machine, or nil. Used to close the request once the software is on.
+	ApprovedInstallRequest(agentID, application string) (*AccessRequest, error)
+
+	// ApprovedInstallsForMachine is every live approval to install software
+	// on ONE machine.
+	//
+	// Its own query rather than a slice of the tenant-wide list, because
+	// that list is paged: it is sorted by update time and truncated BEFORE
+	// anything filters by machine, so a busy tenant pushes one machine's
+	// approval out of the window with other machines' approvals. The
+	// endpoint is then sent a policy that no longer contains an exception it
+	// had, and software that worked yesterday starts asking for a password.
+	ApprovedInstallsForMachine(agentID string) ([]*AccessRequest, error)
+
+	// HasPendingInstallRequest reports whether this machine is already
+	// waiting on an answer about this application.
+	//
+	// Separate from GetAccessRequestsFiltered because that function's search
+	// deliberately covers who asked and which machine — the things an
+	// administrator types into the box — and matches no field naming the
+	// software. Passing an application name to it looks like a lookup and
+	// returns nothing, so a duplicate check written that way always says
+	// "no" and the approver's queue fills with the same ask.
+	HasPendingInstallRequest(agentID, application string) (bool, error)
 
 	// External access events (SSH/RDP intrusion tracking)
 	CreateAccessEvent(ev *AccessEvent) error
@@ -1283,8 +1426,13 @@ func DescribeAsks(a AccessAsks) string {
 		parts = append(parts, "admin access")
 	}
 	if a.AppInstall != nil {
+		// The verb, not the word "install".
+		//
+		// An audit line reading "install: Docker Desktop" for a request to
+		// REMOVE it records the opposite of what happened, and the audit
+		// trail is the one place that has to be right afterwards.
 		parts = append(parts,
-			"install: "+strings.Join(a.AppInstall.Applications, ", "))
+			a.AppInstall.InstallOperation()+": "+strings.Join(a.AppInstall.Applications, ", "))
 	}
 	if len(parts) == 0 {
 		// A request stored before asks existed. Named rather than left blank,

@@ -48,38 +48,32 @@ func (p *PolicyPusher) EnforcementEnabled(tenantID string) bool {
 	return settings.Enforcement
 }
 
-// EffectiveFor resolves one machine's policy.
-func (p *PolicyPusher) EffectiveFor(machine *store.Machine) (policy.Effective, error) {
-	policies, err := p.store.GetAppPoliciesByTenant(machine.TenantID)
-	if err != nil {
-		return policy.Effective{}, fmt.Errorf("loading policies: %w", err)
-	}
-	return policy.Resolve(machine, policies, p.EnforcementEnabled(machine.TenantID)), nil
-}
-
 // PushTo delivers one machine's policy to it.
 //
 // An offline machine is not an error: it will be sent its policy when it next
 // connects, which is the whole reason the on-connect path exists.
+//
+// This goes through pushResolved, so a single-machine push and a fleet sweep
+// send the same thing. It used to resolve and marshal here instead, under a
+// comment claiming the two could not drift — and they had already drifted in
+// the way that mattered most: only pushResolved attached ApprovedInstalls.
+//
+// Every route that delivers policy to ONE machine runs through here — the
+// on-connect push and the menu bar's "Sync Now" — so an approval reached a
+// Mac only if somebody happened to edit a policy afterwards and trigger a
+// tenant-wide sweep. Approving a request appeared to work, delivered a
+// policy with no exceptions in it, and the endpoint went on refusing the
+// software with nothing anywhere reporting a fault.
 func (p *PolicyPusher) PushTo(machine *store.Machine) error {
 	if !p.manager.IsAgentConnected(machine.AgentID) {
 		return nil
 	}
 
-	eff, err := p.EffectiveFor(machine)
+	policies, err := p.store.GetAppPoliciesByTenant(machine.TenantID)
 	if err != nil {
-		return err
+		return fmt.Errorf("loading policies: %w", err)
 	}
-
-	encoded, err := json.Marshal(eff)
-	if err != nil {
-		// A policy that cannot be serialised must not be silently skipped:
-		// the machine would keep running its previous one while the portal
-		// showed the new one as applied.
-		return fmt.Errorf("encoding the policy: %w", err)
-	}
-
-	return p.manager.SendAppPolicy(machine.AgentID, string(encoded))
+	return p.pushResolved(machine, policies, p.EnforcementEnabled(machine.TenantID))
 }
 
 // PushToTenant delivers the current policy to every connected machine in a
@@ -127,6 +121,14 @@ func (p *PolicyPusher) PushToTenant(tenantID string) (pushed int, failed int) {
 // point and goes through the same resolver, so the two cannot drift.
 func (p *PolicyPusher) pushResolved(machine *store.Machine, policies []*store.AppPolicy, enforcing bool) error {
 	eff := policy.Resolve(machine, policies, enforcing)
+
+	// Exceptions are attached AFTER resolution, never inside it.
+	//
+	// Resolve is called by the portal's simulation as well as by this push,
+	// and a simulation that invented exceptions would report a fleet nobody
+	// has. Keeping it pure is also what lets the two agree about what a
+	// policy does, which is the whole reason they share the function.
+	eff.ApprovedInstalls = p.approvedInstallsFor(machine, policies)
 
 	encoded, err := json.Marshal(eff)
 	if err != nil {
@@ -201,4 +203,62 @@ func (s *AgentServer) allowPolicyRequest(agentID string) bool {
 	}
 	s.policyReqAt[agentID] = now
 	return true
+}
+
+// approvedInstallsFor is the live exceptions for one machine.
+//
+// Read at push time rather than cached: an approval that has been revoked, or
+// has lapsed, must stop being delivered on the next push, and a cache is a
+// second place for the answer to be wrong.
+func (p *PolicyPusher) approvedInstallsFor(machine *store.Machine, policies []*store.AppPolicy) []policy.ApprovedInstall {
+	requests, err := p.store.ApprovedInstallsForMachine(machine.AgentID)
+	if err != nil {
+		// Nothing rather than everything. An unreadable store must not open
+		// a machine up; it must leave policy as it was.
+		p.logger.Warn("could not read this machine's approved installs",
+			zap.String("agent_id", machine.AgentID), zap.Error(err))
+		return nil
+	}
+
+	now := time.Now()
+	var out []policy.ApprovedInstall
+	for _, r := range requests {
+		if r.Asks.AppInstall == nil {
+			continue
+		}
+		// An approval with no end, or one that has passed, delivers nothing.
+		// The sweep marks these expired within five minutes, and until it
+		// does this is what stops them applying.
+		if r.ExpiresAt == nil || !r.ExpiresAt.After(now) {
+			continue
+		}
+		for _, app := range r.Asks.AppInstall.Applications {
+			exception := policy.ApprovedInstall{
+				Application: app,
+				// Carried through so the endpoint can refuse an application
+				// of the same name signed by somebody else.
+				Publisher:   r.Asks.AppInstall.Publisher,
+				BundleID:    r.Asks.AppInstall.BundleID,
+				InstallPath: r.Asks.AppInstall.InstallPath,
+				Until:       *r.ExpiresAt,
+				Operation:   r.Asks.AppInstall.InstallOperation(),
+				Spent:       r.UsedAt != nil,
+			}
+
+			// A block written AFTER the approval supersedes it.
+			//
+			// Without this, blocking an application did not stick: it was
+			// removed from the machine, and then reinstalled itself on the
+			// next mount because an approval granted before the rule existed
+			// still said it was allowed.
+			if r.ApprovedAt != nil && policy.BlockedAfter(policies, *r.ApprovedAt, exception) {
+				p.logger.Info("an approval is superseded by a later block rule",
+					zap.String("application", app),
+					zap.String("machine", machine.Name))
+				continue
+			}
+			out = append(out, exception)
+		}
+	}
+	return out
 }

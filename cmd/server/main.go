@@ -588,10 +588,15 @@ func main() {
 					continue
 				}
 				for _, ar := range expired {
-					if err := st.RevokeMachineAccess(ar.MachineID, ar.RequesterUsername); err != nil {
-						logger.Warn("Failed to revoke expired machine access",
-							zap.String("request_id", ar.ID.Hex()),
-							zap.Error(err))
+					// Only where approving it granted access in the first
+					// place. An expiring install-only request must not strip
+					// access somebody holds from a different, live request.
+					if ar.Asks.GrantsMachineAccess() {
+						if err := st.RevokeMachineAccess(ar.MachineID, ar.RequesterUsername); err != nil {
+							logger.Warn("Failed to revoke expired machine access",
+								zap.String("request_id", ar.ID.Hex()),
+								zap.Error(err))
+						}
 					}
 					ar.Status = "expired"
 					if err := st.UpdateAccessRequest(ar); err != nil {

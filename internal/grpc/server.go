@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vsay/vsay-agent-backend/internal/approvers"
 	"github.com/vsay/vsay-agent-backend/internal/email"
 	"github.com/vsay/vsay-agent-backend/internal/metrics"
 	"github.com/vsay/vsay-agent-backend/internal/store"
@@ -33,6 +34,11 @@ type AgentServer struct {
 	// policyPusher is shared with the API layer, so the on-connect push and
 	// the admin-save push resolve a machine's policy the same way.
 	policyPusher *PolicyPusher
+
+	// approvers answers who decides access requests for a machine, which
+	// lives in vsay-auth because that is where groups and their
+	// administrators are. Stateless and safe to share.
+	approvers *approvers.Service
 
 	// policyReqAt rate-limits agent-initiated policy requests, per machine.
 	// The map is small — one entry per machine that has ever pressed the
@@ -60,10 +66,11 @@ type RDPDataHandler interface {
 
 func NewAgentServer(s store.Store, m *AgentManager, l *zap.Logger) *AgentServer {
 	return &AgentServer{
-		store:   s,
-		manager: m,
-		logger:  l,
-		email:   email.New(),
+		store:     s,
+		manager:   m,
+		logger:    l,
+		email:     email.New(),
+		approvers: approvers.New(),
 	}
 }
 
@@ -557,6 +564,18 @@ func (s *AgentServer) Stream(stream agentv1.AgentService_StreamServer) error {
 				// entitled to is decided here, from the machine record.
 				if statusVal == PolicyRequestDiscriminator {
 					go s.handlePolicyRequest(agentID)
+				}
+				// Somebody opened an installer the policy forbids and asked
+				// for it. Raised as an access request an administrator can
+				// act on, rather than left as a refusal nobody hears about.
+				if statusVal == InstallRequestDiscriminator {
+					go s.handleInstallRequest(agentID, payload.Status.Message)
+				}
+				// What became of an approval. An install is not a session:
+				// it either happened or it did not, and without this the
+				// request sat in "Active" for its whole window either way.
+				if statusVal == InstallResultDiscriminator {
+					go s.handleInstallResult(agentID, payload.Status.Message)
 				}
 			case *agentv1.AgentMessage_TerminalOutput:
 				// RDP tunnel sessions ("rdp_") carry port-forward data for the
