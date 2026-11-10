@@ -138,7 +138,26 @@ func (m *RemoteControlManager) HandleAgentData(sessionID string, data []byte) {
 	}
 
 	if msg.State != "" {
-		s.State = msg.State
+		// ACTIVE needs a port to be worth anything.
+		//
+		// The browser is sent to this session the moment the state says
+		// active, and the only thing it can do there is connect to a port.
+		// A message claiming active without one — from an older agent, or
+		// from a status reply that raced the session ending — used to be
+		// believed, and the next request answered 502: "active session but
+		// no port to connect to", which reads as a broken machine.
+		//
+		// The port may arrive in THIS message or have arrived in an earlier
+		// one for the same session; either is a session that can be
+		// connected to. Neither means not ready, and not ready is a state
+		// the console already handles.
+		if msg.State == rcStateActive && msg.Port == 0 && s.Port == 0 {
+			m.logger.Warn("Ignoring an active remote-control state with no port",
+				zap.String("agent_id", agentID),
+				zap.String("session", msg.SessionID))
+		} else {
+			s.State = msg.State
+		}
 	}
 	if msg.SessionID != "" {
 		s.SessionID = msg.SessionID

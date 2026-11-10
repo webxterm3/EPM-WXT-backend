@@ -149,6 +149,16 @@ type Decision struct {
 }
 
 // appliesTo reports whether a policy covers a machine.
+// AppliesTo is appliesTo, exported.
+//
+// Exported so the policy LIST can count a policy's reach with the same
+// function the resolver decides with. A second implementation for the
+// screen would be a second opinion about which machines a policy covers —
+// and the screen exists precisely to say when the resolver reaches none.
+func AppliesTo(p *store.AppPolicy, machine *store.Machine) bool {
+	return appliesTo(p, machine)
+}
+
 func appliesTo(p *store.AppPolicy, machine *store.Machine) bool {
 	switch p.Scope.Kind {
 	case store.PolicyScopeMachine:

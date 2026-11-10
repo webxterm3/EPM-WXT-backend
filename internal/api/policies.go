@@ -52,6 +52,21 @@ func (h *Handler) ListAppPolicies(c *gin.Context) {
 		return
 	}
 
+	// How many machines each policy actually reaches.
+	//
+	// Worked out here rather than left to the screen, because the screen has
+	// no way to know: a policy names AGENT IDs, and an agent ID belongs to
+	// one enrolment rather than to a Mac. Re-enrol a machine and the policy
+	// goes on naming an id nothing answers to — it applies to nobody, while
+	// the list still shows it enabled and enforcing.
+	//
+	// Nothing fails when it happens. The resolver correctly finds no policy
+	// for the machine, the agent correctly reports "no rule covers this",
+	// and the approval route correctly offers to ask — so the only visible
+	// symptom is software an operator believes they blocked asking to be
+	// approved.
+	h.countMachinesInScope(tenantID, policies)
+
 	c.JSON(http.StatusOK, gin.H{
 		"policies": policies,
 		// Said out loud on every read so the UI never has to assume whether
@@ -569,4 +584,42 @@ func (h *Handler) ListEnforcementEvents(c *gin.Context) {
 		"search":              search,
 		"enforcement_enabled": h.enforcementEnabled(tenantID),
 	})
+}
+
+// countMachinesInScope fills in MachinesInScope for each policy.
+//
+// One machine listing for the whole page, not one per policy: a tenant with
+// forty policies would otherwise make forty identical queries to answer one
+// screen.
+//
+// A failure leaves the field nil rather than zero. "We could not work it
+// out" and "it reaches nobody" are different answers, and showing the first
+// as the second would put a warning on every policy on the page the moment
+// the database hiccupped.
+func (h *Handler) countMachinesInScope(tenantID string, policies []*store.AppPolicy) {
+	if len(policies) == 0 {
+		return
+	}
+
+	machines, err := h.store.GetMachinesByTenantID(tenantID)
+	if err != nil {
+		return
+	}
+
+	for _, p := range policies {
+		n := 0
+		for _, m := range machines {
+			if m.Revoked {
+				// A revoked machine is not reached by anything, so counting
+				// it would report a policy as live when its only machine is
+				// one the tenant has cut off.
+				continue
+			}
+			if policy.AppliesTo(p, m) {
+				n++
+			}
+		}
+		count := n
+		p.MachinesInScope = &count
+	}
 }

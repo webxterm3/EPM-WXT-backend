@@ -484,6 +484,19 @@ type AppPolicy struct {
 	UpdatedAt time.Time `bson:"updated_at" json:"updated_at"`
 	CreatedBy string    `bson:"created_by,omitempty" json:"created_by,omitempty"`
 	UpdatedBy string    `bson:"updated_by,omitempty" json:"updated_by,omitempty"`
+	// MachinesInScope is how many machines this policy actually reaches.
+	//
+	// Computed on read, never stored — hence bson:"-". It exists because a
+	// machine-scoped policy names agent IDs, and an agent ID belongs to one
+	// ENROLMENT, not to a Mac. Re-enrol the machine and it gets a new one,
+	// while the policy goes on naming the old. The policy then applies to
+	// nothing at all, and every screen still shows it as enabled and
+	// enforcing, because every screen was reading the policy rather than
+	// asking who it reaches.
+	//
+	// A pointer so "not computed" and "computed as zero" are different
+	// answers: a list that omits this must not render as "reaches nobody".
+	MachinesInScope *int `bson:"-" json:"machines_in_scope,omitempty"`
 }
 
 // PolicyScope says which machines a policy applies to.

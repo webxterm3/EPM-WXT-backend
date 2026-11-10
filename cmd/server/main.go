@@ -23,7 +23,6 @@ import (
 	"github.com/vsay/vsay-agent-backend/internal/api"
 	"github.com/vsay/vsay-agent-backend/internal/ca"
 	"github.com/vsay/vsay-agent-backend/internal/grpc"
-	logmgr "github.com/vsay/vsay-agent-backend/internal/logmanager"
 	"github.com/vsay/vsay-agent-backend/internal/metrics"
 	agentmiddleware "github.com/vsay/vsay-agent-backend/internal/middleware"
 	"github.com/vsay/vsay-agent-backend/internal/reconciler"
@@ -251,8 +250,20 @@ func main() {
 	// Agent system-log intake — called by agents shipping the MACHINE's own
 	// logs (Windows Event Log / macOS unified log / website activity).
 	// Auth: Bearer <registration_token>, the same credential as sign-cert.
-	logIngest := api.NewLogIngestHandler(st, logger)
-	r.POST("/agent/logs", logIngest.Ingest)
+	//
+	// FORWARDED to wxt-log-manager, which does the work. This stays the
+	// door only because agents post to the host in their own configuration
+	// over a pinned CA, so moving the address means reconfiguring every
+	// machine. Nothing here reads the body.
+	logForwarder, err := api.NewLogForwarder(os.Getenv("WXT_LOG_MANAGER_URL"), logger)
+	if err != nil {
+		logger.Fatal("Could not set up log forwarding", zap.Error(err))
+	}
+	if os.Getenv("WXT_LOG_MANAGER_URL") == "" {
+		logger.Warn("WXT_LOG_MANAGER_URL is not set — agents shipping logs will " +
+			"be told to hold them until it is")
+	}
+	r.POST("/agent/logs", logForwarder.Ingest)
 
 	// Agent cert signing — called by agents during configure/renewal
 	// Auth: Bearer <registration_token>
@@ -481,6 +492,7 @@ func main() {
 		// reports, the portal displays, nothing is enforced on any endpoint.
 		auth.GET("/machines/:agent_id/applications", h.GetMachineApplications)
 		auth.POST("/machines/:agent_id/applications/scan", h.RequestMachineInventoryScan)
+		auth.POST("/machines/:agent_id/logs/ship-now", h.RequestMachineLogShip)
 		auth.GET("/applications/catalog", h.GetAppCatalog)
 		auth.POST("/applications/scan", h.RequestFleetInventoryScan)
 		auth.GET("/applications/machines", h.GetMachinesWithApp)
@@ -515,6 +527,7 @@ func main() {
 
 		auth.GET("/config/s3", h.GetS3Config)
 		auth.POST("/config/s3", h.SaveS3Config)
+		auth.POST("/config/s3/test", h.TestS3Config)
 		auth.GET("/config/log-shipping", h.GetLogShippingConfig)
 		auth.POST("/config/log-shipping", h.SaveLogShippingConfig)
 
@@ -535,21 +548,14 @@ func main() {
 		auth.GET("/access-requests", h.AdminOrSuperAdmin(), h.ListAccessRequests)
 		auth.POST("/access-requests/:id/revoke", h.AdminOrSuperAdmin(), h.RevokeAccessRequest)
 
-		// Log management — GET visible to admin+super_admin, write ops super_admin only
-		logAdminRoutes := auth.Group("/log-management")
-		logAdminRoutes.Use(h.AdminOrSuperAdmin())
-		{
-			logAdminRoutes.GET("/config", h.GetLogManagementConfig)
-			logAdminRoutes.GET("/runs", h.GetArchiveRuns)
-		}
-		logSuperRoutes := auth.Group("/log-management")
-		logSuperRoutes.Use(h.SuperAdminOnly())
-		{
-			logSuperRoutes.POST("/config", h.SaveLogManagementConfig)
-			logSuperRoutes.POST("/test-connection", h.TestStorageConnection)
-			logSuperRoutes.POST("/archive-now", h.TriggerArchiveNow)
-			logSuperRoutes.POST("/runs/:run_id/restore", h.RestoreFromRun)
-		}
+		// Log management MOVED to wxt-log-manager.
+		//
+		// Retention reads expired records, archives them and then deletes
+		// them, which is the one job in this platform where two processes
+		// doing it at once is worse than neither: both sweep the same
+		// batch, one archives it, and the other deletes it from underneath.
+		// So it runs in exactly one service, and that service is no longer
+		// this one. vsay-auth proxies /api/log-management/* there.
 	}
 
 	// Start services
@@ -568,10 +574,13 @@ func main() {
 	// Reconciler
 	go rec.Start(ctx)
 
-	// Log management reconciler (archival/deletion on schedule)
-	logManager := logmgr.NewManager(st, logger)
-	logReconciler := logmgr.NewReconciler(logManager, st, logger)
-	go logReconciler.Run(ctx)
+	// The log-management reconciler now runs in wxt-log-manager.
+	//
+	// It must run in exactly ONE process. Two of them sweep the same batch
+	// of expired records: one archives it and the other deletes it from
+	// underneath, and what comes out is records gone from the database and
+	// absent from the archive. Starting it here as well as there would be
+	// that, on a schedule.
 
 	// Auto-revoke expired access requests every 5 minutes
 	go func() {

@@ -261,3 +261,37 @@ func (h *Handler) authorizeMachineRead(c *gin.Context) (*store.Machine, bool) {
 	}
 	return machine, true
 }
+
+// RequestMachineLogShip asks one machine to ship its system logs now.
+//
+// POST /api/machines/:agent_id/logs/ship-now
+//
+// Same shape as the inventory scan above and for the same reasons: the
+// response says the request was DELIVERED, never that logs arrived. The
+// agent reads its sources, uploads a batch and the archive catches up some
+// seconds later — claiming otherwise would have the console show an empty
+// log view under the word "done".
+func (h *Handler) RequestMachineLogShip(c *gin.Context) {
+	machine, ok := h.authorizeMachineRead(c)
+	if !ok {
+		return
+	}
+
+	if !h.agentManager.IsAgentConnected(machine.AgentID) {
+		// 409, not 500: nothing is broken, the machine is simply not there.
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "This machine is offline. It ships its logs on its own when the agent reconnects.",
+		})
+		return
+	}
+
+	if err := h.agentManager.SendLogShipNow(machine.AgentID); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Could not reach the agent: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"requested": true,
+		"message":   "Requested. New records appear here once the machine has uploaded them.",
+	})
+}

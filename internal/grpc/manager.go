@@ -353,6 +353,37 @@ const InventoryScanCommandID = "__vsay_inventory_scan__"
 // ordinary inventory channel, exactly as it does for a scheduled scan. That is
 // what keeps one code path for "software was reported" rather than a second
 // one that only on-demand scans ever take.
+// LogShipNowCommandID asks an agent to ship its system logs now.
+//
+// Must match the agent's constant exactly. A mismatch is silent at both
+// ends: the agent ignores a command id it does not know, and this returns
+// nil because the message was delivered — so the console says "requested"
+// and nothing ever arrives.
+const LogShipNowCommandID = "__vsay_logship_now__"
+
+// SendLogShipNow asks one agent to poll its log sources immediately.
+func (m *AgentManager) SendLogShipNow(agentID string) error {
+	conn := m.GetConnection(agentID)
+	if conn == nil {
+		return fmt.Errorf("agent not connected")
+	}
+
+	msg := &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_Command{
+			Command: &agentv1.CommandRequest{
+				CommandId: LogShipNowCommandID,
+			},
+		},
+	}
+
+	select {
+	case conn.InputChan <- msg:
+		return nil
+	case <-time.After(time.Second):
+		return fmt.Errorf("timeout asking the agent to ship its logs")
+	}
+}
+
 func (m *AgentManager) SendInventoryScan(agentID string) error {
 	conn := m.GetConnection(agentID)
 	if conn == nil {

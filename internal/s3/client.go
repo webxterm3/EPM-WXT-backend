@@ -124,8 +124,25 @@ func (c *Client) Download(ctx context.Context, key string) ([]byte, error) {
 
 // TestConnection verifies the bucket is reachable and the credentials are valid.
 func (c *Client) TestConnection(ctx context.Context) error {
-	_, err := c.s3Client.HeadBucket(ctx, &s3.HeadBucketInput{
-		Bucket: aws.String(c.bucket),
+	// A one-key LIST, not HeadBucket.
+	//
+	// HeadBucket is a HEAD request, so its response has NO BODY — and S3
+	// puts the reason in the body. A failure could only be reported as the
+	// status line:
+	//
+	//	StatusCode: 400, RequestID: , HostID: , api error BadRequest: Bad Request
+	//
+	// Empty request id, empty host id, no cause. A wrong region, malformed
+	// credentials and a bucket name invalid for this endpoint all arrive
+	// looking identical, and the person who could fix it is told nothing.
+	//
+	// ListObjectsV2 is a GET, so S3 answers with a real error document —
+	// "the region 'us-east-1' is wrong; expecting 'ap-south-1'" is a
+	// sentence somebody can act on. MaxKeys is 1 because the question is
+	// whether the bucket answers, not what is in it.
+	_, err := c.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(c.bucket),
+		MaxKeys: aws.Int32(1),
 	})
 	return err
 }
