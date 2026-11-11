@@ -420,3 +420,111 @@ func (m *AgentManager) KickAgent(agentID string) {
 		// called from the stream goroutine when it sees the context cancelled.
 	}
 }
+
+// SendAccountScan asks an agent to re-scan its local accounts now.
+//
+// Separate from SendInventoryScan rather than parameterised, because the two
+// scans have different costs and different cadences, and a single "scan now"
+// that did both would make the cheap one wait on the expensive one.
+func (m *AgentManager) SendAccountScan(agentID string) error {
+	conn := m.GetConnection(agentID)
+	if conn == nil {
+		return fmt.Errorf("agent not connected")
+	}
+
+	msg := &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_Command{
+			Command: &agentv1.CommandRequest{
+				CommandId: PrivScanCommandID,
+			},
+		},
+	}
+
+	select {
+	case conn.InputChan <- msg:
+		return nil
+	case <-time.After(time.Second):
+		return fmt.Errorf("timeout asking the agent to scan its accounts")
+	}
+}
+
+// SendPrivilegePolicy delivers a machine's least-privilege policy.
+func (m *AgentManager) SendPrivilegePolicy(agentID, policyJSON string) error {
+	conn := m.GetConnection(agentID)
+	if conn == nil {
+		return fmt.Errorf("agent not connected")
+	}
+
+	msg := &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_Command{
+			Command: &agentv1.CommandRequest{
+				CommandId: PrivPolicyCommandID,
+				Command:   policyJSON,
+			},
+		},
+	}
+
+	select {
+	case conn.InputChan <- msg:
+		return nil
+	case <-time.After(time.Second):
+		return fmt.Errorf("timeout sending the privilege policy")
+	}
+}
+
+// CreateAccountCommandID asks an agent to create one local account.
+//
+// Its payload carries a password, so it is the one command whose body must
+// never reach a log on either side.
+const CreateAccountCommandID = "__vsay_createaccount__"
+
+// SendCreateAccount asks an agent to create a local account.
+func (m *AgentManager) SendCreateAccount(agentID, specJSON string) error {
+	conn := m.GetConnection(agentID)
+	if conn == nil {
+		return fmt.Errorf("agent not connected")
+	}
+
+	msg := &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_Command{
+			Command: &agentv1.CommandRequest{
+				CommandId: CreateAccountCommandID,
+				Command:   specJSON,
+			},
+		},
+	}
+
+	select {
+	case conn.InputChan <- msg:
+		return nil
+	case <-time.After(time.Second):
+		return fmt.Errorf("timeout asking the agent to create the account")
+	}
+}
+
+// AccountActionCommandID asks an agent to change one account.
+const AccountActionCommandID = "__vsay_accountaction__"
+
+// SendAccountAction asks an agent to change one account.
+func (m *AgentManager) SendAccountAction(agentID, actionJSON string) error {
+	conn := m.GetConnection(agentID)
+	if conn == nil {
+		return fmt.Errorf("agent not connected")
+	}
+
+	msg := &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_Command{
+			Command: &agentv1.CommandRequest{
+				CommandId: AccountActionCommandID,
+				Command:   actionJSON,
+			},
+		},
+	}
+
+	select {
+	case conn.InputChan <- msg:
+		return nil
+	case <-time.After(time.Second):
+		return fmt.Errorf("timeout sending the account action")
+	}
+}

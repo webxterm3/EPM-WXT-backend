@@ -32,6 +32,15 @@ type Machine struct {
 	DeployApplication bool               `bson:"deploy_application" json:"deploy_application"`
 	CustomScript      string             `bson:"custom_script,omitempty" json:"custom_script,omitempty"`
 
+	// DefaultUserAppliedAt records the organisation's default account having
+	// been created on this machine.
+	//
+	// Per machine and set once, so a machine that reconnects a hundred times
+	// is asked once. Without it every reconnect would re-send the request,
+	// and the endpoint would answer "an account named X already exists" a
+	// hundred times into the audit trail.
+	DefaultUserAppliedAt *time.Time `bson:"default_user_applied_at,omitempty" json:"default_user_applied_at,omitempty"`
+
 	// Security fields
 	Revoked         bool       `bson:"revoked" json:"revoked"` // True = all cert signing rejected + gRPC kicked
 	RevokedAt       *time.Time `bson:"revoked_at,omitempty" json:"revoked_at,omitempty"`
@@ -139,6 +148,333 @@ type InstalledApp struct {
 	// cheaper than asking the database about three hundred keys individually.
 	ScanID    string    `bson:"scan_id" json:"-"`
 	UpdatedAt time.Time `bson:"updated_at" json:"updated_at"`
+}
+
+// LocalAccount is one user account on one machine, as last reported by its
+// agent.
+//
+// Rows are marked gone rather than deleted, for a sharper reason than the
+// software inventory's: "who held administrator rights on this machine in
+// March" is a question an auditor asks, and the answer must survive the
+// account being deleted by whoever held it.
+type LocalAccount struct {
+	ID          primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	MachineID   primitive.ObjectID `bson:"machine_id" json:"machine_id"`
+	AgentID     string             `bson:"agent_id" json:"agent_id"`
+	MachineName string             `bson:"machine_name" json:"machine_name"`
+	TenantID    string             `bson:"tenant_id" json:"tenant_id"`
+
+	// AccountKey is the account's identity on this machine, assigned by the
+	// agent: "uid:501" on macOS, "sid:S-1-5-…" on Windows.
+	//
+	// Never the username. Renaming an account changes what people call it and
+	// changes nothing about what it can do, so a username-keyed row would
+	// report a rename as one administrator disappearing and another appearing
+	// — the most alarming event this inventory can produce, from a non-event.
+	AccountKey string `bson:"account_key" json:"account_key"`
+
+	Username      string `bson:"username" json:"username"`
+	UsernameLower string `bson:"username_lower" json:"-"`
+	FullName      string `bson:"full_name,omitempty" json:"full_name,omitempty"`
+
+	UID int    `bson:"uid,omitempty" json:"uid,omitempty"`
+	SID string `bson:"sid,omitempty" json:"sid,omitempty"`
+
+	// IsAdmin is what this entire collection exists to record.
+	IsAdmin bool `bson:"is_admin" json:"is_admin"`
+
+	// IsLocal separates an account this machine owns from one it recognises
+	// because it is joined to a directory. Policy must never act on the
+	// second kind, so this is not a display detail.
+	IsLocal bool `bson:"is_local" json:"is_local"`
+
+	// Demotable is the agent's answer to "could policy remove this account's
+	// administrator rights", stored rather than recomputed.
+	//
+	// Stored because the endpoint is the only party that knows the full
+	// truth — whether the account is local, whether it is a system account on
+	// that platform's own terms — and because a second implementation here
+	// would eventually disagree with the one that acts. When they disagree,
+	// somebody is told their fleet is compliant while it is not.
+	Demotable bool `bson:"demotable" json:"demotable"`
+
+	Source   string `bson:"source" json:"source"`
+	Shell    string `bson:"shell,omitempty" json:"shell,omitempty"`
+	HomeDir  string `bson:"home_dir,omitempty" json:"home_dir,omitempty"`
+	Disabled bool   `bson:"disabled,omitempty" json:"disabled,omitempty"`
+	Hidden   bool   `bson:"hidden,omitempty" json:"hidden,omitempty"`
+
+	LastLogin *time.Time `bson:"last_login,omitempty" json:"last_login,omitempty"`
+
+	// AdminUntil is when a time-limited grant of administrator rights ends.
+	//
+	// Comes from the agent's own record — an operating system has no notion
+	// of "administrator until Tuesday" — and is absent for rights that do
+	// not end. Absent therefore means permanent, which is the stronger
+	// statement of the two and is why it is a pointer rather than a zero
+	// time that would read as "expired in year one".
+	AdminUntil *time.Time `bson:"admin_until,omitempty" json:"admin_until,omitempty"`
+
+	// AdminSince is when this account was first seen holding administrator
+	// rights, and is cleared when it is seen without them.
+	//
+	// It is the field that turns a list into evidence: "has held local admin
+	// since March" is a finding, while "holds local admin" is a status.
+	AdminSince *time.Time `bson:"admin_since,omitempty" json:"admin_since,omitempty"`
+
+	FirstSeen time.Time  `bson:"first_seen" json:"first_seen"`
+	LastSeen  time.Time  `bson:"last_seen" json:"last_seen"`
+	Present   bool       `bson:"present" json:"present"`
+	RemovedAt *time.Time `bson:"removed_at,omitempty" json:"removed_at,omitempty"`
+
+	// ScanID is the snapshot that last touched this row. The removal sweep
+	// marks everything the latest scan did not touch.
+	ScanID    string    `bson:"scan_id" json:"-"`
+	UpdatedAt time.Time `bson:"updated_at" json:"updated_at"`
+}
+
+// PrivilegePolicy says who may hold local administrator rights.
+//
+// A separate type from AppPolicy rather than a new action on it. AppPolicy's
+// rules match APPLICATIONS — name, publisher, path, bundle id, hash. This
+// matches ACCOUNTS. Folding them together would give every application rule a
+// set of account-shaped fields it must ignore, and every account rule a set of
+// application-shaped ones, and the editor would have to hide half of itself
+// depending on which kind of policy somebody picked.
+//
+// There is also no ordered rule list here, and that is deliberate. "Does this
+// machine remove local administrator rights" is one decision, not a sequence
+// of matches with a first-match-wins order. Giving it rules would invite
+// somebody to write five of them and then ask why the third one lost.
+type PrivilegePolicy struct {
+	ID          primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	TenantID    string             `bson:"tenant_id" json:"tenant_id"`
+	Name        string             `bson:"name" json:"name"`
+	Description string             `bson:"description,omitempty" json:"description,omitempty"`
+	Enabled     bool               `bson:"enabled" json:"enabled"`
+
+	// Scope reuses the application-policy primitive verbatim, so a machine
+	// resolves both kinds of policy by the same rules and an operator learns
+	// the scope picker once.
+	Scope PolicyScope `bson:"scope" json:"scope"`
+
+	// Mode is audit or enforce, the same vocabulary as AppPolicy.
+	//
+	// A policy asking to enforce only does so once the tenant's PRIVILEGE
+	// enforcement switch is on — which is a different switch from the
+	// application one. See PrivilegeSettings.
+	Mode string `bson:"mode" json:"mode"`
+
+	// Priority breaks ties between policies at the same scope, higher first.
+	Priority int `bson:"priority" json:"priority"`
+
+	// DemoteAdmins is the instruction: remove local administrator rights from
+	// the accounts that hold them.
+	//
+	// Default false, and false is what an absent field decodes to. A policy
+	// that fails to load, or loads from a half-written document, therefore
+	// removes nobody's rights.
+	DemoteAdmins bool `bson:"demote_admins" json:"demote_admins"`
+
+	// KeepAdmin names accounts that keep their rights regardless.
+	//
+	// Matched on username, because a username is what an operator knows — the
+	// UID is a thing they would have to look up per machine. The endpoint
+	// resolves it to an account and refuses anything it cannot resolve.
+	KeepAdmin []string `bson:"keep_admin,omitempty" json:"keep_admin,omitempty"`
+
+	// BreakGlass is the account that guarantees the machine is never left
+	// without an administrator.
+	BreakGlass BreakGlassSpec `bson:"break_glass" json:"break_glass"`
+
+	// Elevation is how somebody gets privilege back for a specific task once
+	// their standing rights are gone.
+	Elevation ElevationSpec `bson:"elevation" json:"elevation"`
+
+	CreatedAt time.Time `bson:"created_at" json:"created_at"`
+	CreatedBy string    `bson:"created_by,omitempty" json:"created_by,omitempty"`
+	UpdatedAt time.Time `bson:"updated_at" json:"updated_at"`
+	UpdatedBy string    `bson:"updated_by,omitempty" json:"updated_by,omitempty"`
+
+	// MachinesInScope is how many machines this policy actually reaches,
+	// computed on read. A pointer so "not computed" is distinguishable from
+	// "reaches nobody" — the second is a warning worth showing, the first is
+	// a database hiccup and must not produce one.
+	MachinesInScope *int `bson:"-" json:"machines_in_scope,omitempty"`
+}
+
+// BreakGlassSpec describes the account that keeps a machine recoverable.
+//
+// This exists because of what the alternative looks like. Remove the last
+// administrator from a laptop and the recovery is Recovery Mode and a
+// physical visit — for a mistake made in a web form, possibly across a whole
+// fleet at once. Every product that does this keeps a way back in.
+type BreakGlassSpec struct {
+	// Enabled turns the managed account on. With it off, the endpoint still
+	// refuses to leave a machine with no administrator at all; this only
+	// controls whether the agent maintains an account of its own for it.
+	Enabled bool `bson:"enabled" json:"enabled"`
+
+	// Username is the local account the agent creates and keeps as an
+	// administrator.
+	Username string `bson:"username,omitempty" json:"username,omitempty"`
+
+	// FullName is what the account is called in the login window, so somebody
+	// looking at the machine can tell it is managed rather than a stranger.
+	FullName string `bson:"full_name,omitempty" json:"full_name,omitempty"`
+
+	// Hidden keeps it out of the login window.
+	//
+	// Off by default, deliberately. A hidden administrator account is also
+	// exactly what a backdoor looks like, and the account inventory flags
+	// that combination — so an operator who wants it should have to ask.
+	Hidden bool `bson:"hidden,omitempty" json:"hidden,omitempty"`
+}
+
+// ElevationSpec is how privilege is given back for a task, once standing
+// administrator rights are gone.
+//
+// The shape of this is set by a decision already recorded in the agent, in
+// internal/pendinginstall/dragdrop_darwin.go: the product does NOT hand out
+// membership of the administrators group, even temporarily, because that
+// group is in sudoers and for the length of the window the person could run
+// anything as root — including stopping the agent. A management product that
+// hands out the ability to switch itself off has given away more than the
+// problem was worth.
+//
+// So elevation here is task-scoped: install this software, run these named
+// commands. The one exception is spelled out in AllowFullAdminGrant below.
+type ElevationSpec struct {
+	// AllowInstallRequests lets somebody ask for software they are not
+	// allowed to install. This path already exists end to end — the agent
+	// raises the request, an approver answers it, and the agent performs the
+	// install as root on their behalf without ever granting them rights.
+	AllowInstallRequests bool `bson:"allow_install_requests" json:"allow_install_requests"`
+
+	// AllowAdminRequests lets somebody ask for administrator rights outright,
+	// through the existing just-in-time request workflow.
+	AllowAdminRequests bool `bson:"allow_admin_requests" json:"allow_admin_requests"`
+
+	// MaxGrantMinutes bounds how long an approved grant may last, whatever
+	// the request asked for.
+	MaxGrantMinutes int `bson:"max_grant_minutes,omitempty" json:"max_grant_minutes,omitempty"`
+
+	// AllowFullAdminGrant permits an approved request to restore real
+	// administrator-group membership for its window, rather than only the
+	// task-scoped grants above.
+	//
+	// Off by default and separately named so that turning it on is a decision
+	// somebody made, not a default they inherited. During such a window the
+	// person can stop the agent, so every grant of it is recorded and every
+	// sudo command in the window is logged.
+	AllowFullAdminGrant bool `bson:"allow_full_admin_grant,omitempty" json:"allow_full_admin_grant,omitempty"`
+
+	// SudoCommands are the commands a demoted user may still run as root
+	// without asking anybody.
+	//
+	// This is what keeps a demoted machine usable. On macOS the admin group
+	// is in sudoers via %admin, so removing somebody from it silently removes
+	// their sudo as well — a second change they did not ask for and will not
+	// connect to the first when it bites.
+	SudoCommands []SudoCommand `bson:"sudo_commands,omitempty" json:"sudo_commands,omitempty"`
+}
+
+// SudoCommand is one command a demoted user may run as root.
+//
+// Mirrors wxt-agent/internal/sudopolicy.Command, which is already written,
+// validated against a real visudo, and imported by nothing yet.
+type SudoCommand struct {
+	// Path is the absolute path of the command. Absolute because sudoers
+	// matches on the path as written, and a bare name would match whatever
+	// the user's PATH resolved it to.
+	Path string `bson:"path" json:"path"`
+
+	// Args are the exact arguments permitted.
+	Args []string `bson:"args,omitempty" json:"args,omitempty"`
+
+	// AnyArguments permits the command with any arguments at all.
+	//
+	// Explicit rather than implied by an empty Args list, because sudoers has
+	// this exactly backwards from what people expect: a bare command permits
+	// ANY arguments, and permitting none requires writing an empty string.
+	// An operator who left Args empty meaning "no arguments" would have
+	// written the most permissive rule available.
+	AnyArguments bool `bson:"any_arguments,omitempty" json:"any_arguments,omitempty"`
+
+	// NoPassword runs it without prompting.
+	NoPassword bool `bson:"no_password,omitempty" json:"no_password,omitempty"`
+}
+
+// PrivilegeSettings is the tenant's switch for least-privilege enforcement.
+//
+// A SEPARATE document from AppControlSettings, and that separation is the
+// point. Sharing one switch would mean that turning on application blocking
+// also strips administrator rights across the fleet — a far larger act,
+// performed by somebody who thought they were enabling something else. It
+// would fire the first time anybody enabled application control.
+//
+// The default — for a tenant that has never chosen, and for a settings
+// document that fails to read — is false.
+type PrivilegeSettings struct {
+	ID       primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	TenantID string             `bson:"tenant_id" json:"tenant_id"`
+
+	Enforcement bool `bson:"enforcement" json:"enforcement"`
+
+	UpdatedAt time.Time `bson:"updated_at" json:"updated_at"`
+	UpdatedBy string    `bson:"updated_by,omitempty" json:"updated_by,omitempty"`
+}
+
+// FleetConfig is the organisation-wide configuration a super administrator
+// sets once and every machine inherits.
+//
+// Separate from the other settings documents because of who may touch it: a
+// company administrator manages their own policies, while this decides what
+// happens on machines that have not been enrolled yet. It is gated on
+// super_admin for that reason, not because it is more technical.
+type FleetConfig struct {
+	ID       primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	TenantID string             `bson:"tenant_id" json:"tenant_id"`
+
+	// DefaultUser is created on every machine as it enrols.
+	DefaultUser DefaultUserConfig `bson:"default_user" json:"default_user"`
+
+	UpdatedAt time.Time `bson:"updated_at" json:"updated_at"`
+	UpdatedBy string    `bson:"updated_by,omitempty" json:"updated_by,omitempty"`
+}
+
+// DefaultUserConfig is the local account every new machine gets.
+type DefaultUserConfig struct {
+	Enabled bool `bson:"enabled" json:"enabled"`
+
+	Username string `bson:"username,omitempty" json:"username,omitempty"`
+	FullName string `bson:"full_name,omitempty" json:"full_name,omitempty"`
+
+	// Password is SEALED, never plaintext, and never leaves this service.
+	//
+	// It has to be stored at all — unlike the password for a one-off account
+	// created from the portal, which travels to the endpoint and is gone —
+	// because it must survive until a machine that does not exist yet
+	// enrols. The endpoint needs the real characters, so a hash is no use.
+	//
+	// It is excluded from JSON in both directions. The portal sends a new
+	// password through its own field on the request body and never receives
+	// one back: an API that returns the credential for an account on every
+	// machine in the fleet is one browser extension away from being a leak.
+	Password string `bson:"password,omitempty" json:"-"`
+
+	// HasPassword lets the portal show that one is set without being told
+	// what it is. Computed on read, never stored.
+	HasPassword bool `bson:"-" json:"has_password"`
+
+	// Admin makes the default account a local administrator.
+	//
+	// Off by default, and worth stating plainly in the UI: an administrator
+	// created automatically on every machine is a standing way around
+	// everything least privilege enforces, on the whole fleet at once.
+	Admin bool `bson:"admin,omitempty" json:"admin,omitempty"`
+
+	Hidden bool `bson:"hidden,omitempty" json:"hidden,omitempty"`
 }
 
 // InventoryScan records one reported snapshot.
@@ -748,6 +1084,66 @@ const (
 	AuditPolicyUpdated = "policy.updated"
 	AuditPolicyDeleted = "policy.deleted"
 
+	// Least-privilege policy authoring, kept apart from the application
+	// policy actions above so an auditor can filter for "who changed who may
+	// hold administrator rights" without reading every application rule
+	// anybody ever edited.
+	AuditPrivilegePolicyCreated = "privilege_policy.created"
+	AuditPrivilegePolicyUpdated = "privilege_policy.updated"
+	AuditPrivilegePolicyDeleted = "privilege_policy.deleted"
+
+	// AuditPrivilegeEnforcementChanged is the switch that decides whether any
+	// of it bites. Its own action because it is the single most consequential
+	// setting in the product: turning it on removes administrator rights
+	// across a fleet.
+	AuditPrivilegeEnforcementChanged = "privilege_enforcement.changed"
+
+	// What the endpoint actually did. These are the only record of decisions
+	// made on the machine itself — the endpoint re-checks every invariant
+	// against the live account database, so a "skipped" here is the product
+	// declining to do something the portal believed it would do.
+	AuditAdminRightsRemoved  = "admin_rights.removed"
+	AuditAdminRightsRestored = "admin_rights.restored"
+
+	// AuditBreakGlassCreated records the agent creating an OS account. Its
+	// own action because it is the one thing this product does that nothing
+	// else in it does, and it should be impossible to miss in a trail.
+	AuditBreakGlassCreated = "break_glass.created"
+
+	// AuditPrivilegeEnforcementSkipped covers refusals, deferrals and the
+	// sudo grants that go with a demotion.
+	AuditPrivilegeEnforcementSkipped = "privilege_enforcement.skipped"
+
+	// AuditCommandElevated records a command the agent ran with elevated
+	// rights on behalf of somebody who no longer holds them.
+	//
+	// The actor is the endpoint user, not the agent: they asked for it, and
+	// "who ran what as root" is the question this entry exists to answer.
+	AuditCommandElevated = "command.elevated"
+
+	// AuditAccountCreateRequested records an administrator asking for a local
+	// account on an endpoint, and AuditAccountCreated the machine confirming
+	// it. Two entries because the gap between them is real: the request can
+	// be refused by the endpoint, and an estate where the first appears
+	// without the second is one where somebody believes accounts exist that
+	// do not.
+	AuditAccountCreateRequested = "account.create_requested"
+	AuditAccountCreated         = "account.created"
+
+	// AuditAccountManaged records an administrator changing an existing
+	// account on an endpoint: its rights, or whether it is switched on.
+	//
+	// The grant's end time is part of the entry. "Who was made an
+	// administrator, by whom, and until when" is the question this feature
+	// exists to be able to answer afterwards.
+	AuditAccountManaged = "account.managed"
+
+	// Fleet-wide configuration, which only a super administrator may change.
+	// Its own actions because what it reaches is different in kind: machines
+	// that have not been enrolled yet, and every agent in the estate.
+	AuditFleetConfigChanged    = "fleet_config.changed"
+	AuditFleetUpgradeRequested = "fleet.upgrade_requested"
+
 	// Application control. Emitted once enforcement exists; until then the
 	// portal says plainly that nothing has been recorded rather than showing
 	// an empty list that reads like "nothing was blocked".
@@ -784,6 +1180,16 @@ const (
 	// inventory.reported after it is how "the agent is connected but wedged"
 	// shows up in the trail.
 	AuditInventoryScanRequested = "inventory.scan_requested"
+
+	// Local accounts.
+	//
+	// Kept apart from inventory.reported rather than folded into it, because
+	// "this machine told us what software it has" and "this machine told us
+	// who holds administrator rights on it" are answers to different audit
+	// questions, and a reviewer filtering for the second should not have to
+	// read every one of the first.
+	AuditAccountsReported      = "accounts.reported"
+	AuditAccountsScanRequested = "accounts.scan_requested"
 )
 
 // AuditQuery filters an audit listing.
@@ -1324,6 +1730,11 @@ type Store interface {
 	// had, and software that worked yesterday starts asking for a password.
 	ApprovedInstallsForMachine(agentID string) ([]*AccessRequest, error)
 
+	// ApprovedAdminAccessForMachine is every live approval of administrator
+	// rights on ONE machine. Separate from the query above, which asks the
+	// database for app_install asks and would never return one of these.
+	ApprovedAdminAccessForMachine(agentID string) ([]*AccessRequest, error)
+
 	// HasPendingInstallRequest reports whether this machine is already
 	// waiting on an answer about this application.
 	//
@@ -1362,6 +1773,34 @@ type Store interface {
 	GetAppCatalog(tenantID string, q CatalogQuery) ([]CatalogEntry, int64, error)
 	GetMachinesWithApp(tenantID, name, publisher string, limit, skip int) ([]*InstalledApp, int64, error)
 	GetInventoryCoverage(tenantID string, staleAfter time.Duration) (InventoryCoverage, error)
+
+	// Local-account inventory.
+	//
+	// One call, not the two the software inventory needs: an account snapshot
+	// arrives whole, so writing it and sweeping what it did not mention are
+	// the same operation and cannot be performed on a partial report by
+	// accident.
+	ReconcileAccounts(machine *Machine, scanID string, accounts []LocalAccount, at time.Time) (added, updated, removed int64, err error)
+	GetAccountsByMachine(machineID primitive.ObjectID, q AccountQuery) ([]*LocalAccount, error)
+	GetAccountsByTenant(tenantID string, q AccountQuery) ([]*LocalAccount, int64, error)
+
+	// Least-privilege policies, and their own tenant switch.
+	//
+	// The switch is deliberately not the application-control one: sharing it
+	// would mean enabling application blocking also strips administrator
+	// rights across the fleet.
+	CreatePrivilegePolicy(p *PrivilegePolicy) error
+	UpdatePrivilegePolicy(p *PrivilegePolicy) error
+	DeletePrivilegePolicy(tenantID string, id primitive.ObjectID) error
+	GetPrivilegePolicyByID(tenantID string, id primitive.ObjectID) (*PrivilegePolicy, error)
+	GetPrivilegePoliciesByTenant(tenantID string) ([]*PrivilegePolicy, error)
+	GetPrivilegeSettings(tenantID string) (*PrivilegeSettings, error)
+	SetPrivilegeEnforcement(tenantID string, enabled bool, actor string) error
+
+	// Fleet-wide configuration, set by a super administrator.
+	GetFleetConfig(tenantID string) (*FleetConfig, error)
+	SaveFleetConfig(cfg *FleetConfig) error
+	MarkDefaultUserApplied(agentID string, at time.Time) error
 
 	// Application-control policies.
 	GetAppControlSettings(tenantID string) (*AppControlSettings, error)

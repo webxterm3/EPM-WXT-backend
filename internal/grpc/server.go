@@ -22,6 +22,10 @@ import (
 )
 
 type AgentServer struct {
+	// onMachineConnected runs once each time a machine comes up. See
+	// SetOnMachineConnected.
+	onMachineConnected func(*store.Machine)
+
 	agentv1.UnimplementedAgentServiceServer
 	store           store.Store
 	manager         *AgentManager
@@ -46,6 +50,15 @@ type AgentServer struct {
 	// size is bounded by the machines that exist.
 	policyReqMu sync.Mutex
 	policyReqAt map[string]time.Time
+}
+
+// SetOnMachineConnected registers something to run when a machine connects.
+//
+// A function rather than an interface, and set from main rather than
+// imported, because the thing it runs lives in the api package — which
+// already imports this one. Wiring it the other way would be an import cycle.
+func (s *AgentServer) SetOnMachineConnected(fn func(*store.Machine)) {
+	s.onMachineConnected = fn
 }
 
 // SetPolicyPusher wires in the shared resolver/pusher.
@@ -432,6 +445,13 @@ func (s *AgentServer) Stream(stream agentv1.AgentService_StreamServer) error {
 		// The application policy, for the same reason: a machine that was off
 		// when a policy changed must not keep running the previous one.
 		go s.sendAppPolicy(machine)
+
+		// Anything the rest of the server wants to do when a machine arrives
+		// — at present, creating the organisation's default account on a
+		// machine enrolling for the first time.
+		if s.onMachineConnected != nil {
+			go s.onMachineConnected(machine)
+		}
 	}
 
 	// Handle incoming messages from Agent
@@ -524,6 +544,9 @@ func (s *AgentServer) Stream(stream agentv1.AgentService_StreamServer) error {
 				// raw status JSON for them (agent stats especially would flood the log).
 				if statusVal != "__access_event__" && statusVal != "__agent_stats__" &&
 					statusVal != "__access_snapshot__" && statusVal != AppInventoryDiscriminator &&
+					statusVal != PrivInventoryDiscriminator &&
+					statusVal != PrivEnforcementDiscriminator &&
+					statusVal != ElevateResultDiscriminator &&
 					statusVal != EnforcementDiscriminator {
 					s.logger.Info("Agent status update",
 						zap.String("agent_id", agentID),
@@ -553,6 +576,25 @@ func (s *AgentServer) Stream(stream agentv1.AgentService_StreamServer) error {
 				// policy is written against this.
 				if statusVal == AppInventoryDiscriminator {
 					go s.handleAppInventory(agentID, payload.Status.Message)
+				}
+				// Local-account snapshot: who exists on the machine and who
+				// holds administrator rights. Least-privilege policy is
+				// written against this.
+				if statusVal == PrivInventoryDiscriminator {
+					go s.handlePrivInventory(agentID, payload.Status.Message)
+				}
+				// What least-privilege enforcement actually did on the
+				// machine. Like the application-control report, this is the
+				// only record of decisions made on the endpoint itself.
+				if statusVal == PrivEnforcementDiscriminator {
+					go s.handlePrivEnforcement(agentID, payload.Status.Message)
+				}
+				// A command the agent ran with elevated rights on behalf of
+				// somebody who no longer holds them. Reported on its own
+				// channel because it happens at human pace and should reach
+				// the portal while the person is still looking.
+				if statusVal == ElevateResultDiscriminator {
+					go s.handleElevateResult(agentID, payload.Status.Message)
 				}
 				// What application control actually did on the machine. The
 				// only record of decisions made on the endpoint itself.
@@ -639,6 +681,15 @@ func (s *AgentServer) sendAppPolicy(machine *store.Machine) {
 
 	if err := s.policyPusher.PushTo(machine); err != nil {
 		s.logger.Warn("could not send the application policy on connect",
+			zap.String("agent_id", machine.AgentID), zap.Error(err))
+	}
+
+	// The least-privilege policy rides the same moment. Sent even when there
+	// is none, because "no policy" is itself an instruction the endpoint acts
+	// on: it restores any administrator rights this agent removed under a
+	// policy that has since been deleted.
+	if err := s.policyPusher.PushPrivilegeTo(machine); err != nil {
+		s.logger.Warn("could not send the privilege policy on connect",
 			zap.String("agent_id", machine.AgentID), zap.Error(err))
 	}
 }

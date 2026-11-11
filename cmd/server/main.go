@@ -26,6 +26,7 @@ import (
 	"github.com/vsay/vsay-agent-backend/internal/metrics"
 	agentmiddleware "github.com/vsay/vsay-agent-backend/internal/middleware"
 	"github.com/vsay/vsay-agent-backend/internal/reconciler"
+	"github.com/vsay/vsay-agent-backend/internal/secret"
 	"github.com/vsay/vsay-agent-backend/internal/store"
 	"github.com/vsay/vsay-agent-backend/internal/upload"
 	agentv1 "github.com/vsay/vsay-agent-backend/proto/agent/v1"
@@ -181,6 +182,17 @@ func main() {
 	h := api.NewHandler(st, agentManager, uploadService, logger)
 	h.SetPolicyPusher(policyPusher)
 
+	// Secret sealing is optional. With no key configured the server still
+	// runs — it simply cannot store the default account's password, and says
+	// so when somebody tries. Refusing to boot over an optional feature
+	// would be the worse failure.
+	if sealer, err := secret.New(); err != nil {
+		logger.Warn("Stored secrets are unavailable",
+			zap.String("detail", err.Error()))
+	} else {
+		h.SetSealer(sealer)
+	}
+
 	// RDP tunnel manager (remote-desktop feature) — bridges guacd ↔ agent tunnel.
 	rdpManager := api.NewRDPManager(agentManager, st, logger)
 	h.SetRDPManager(rdpManager)
@@ -204,6 +216,12 @@ func main() {
 	agentServer := grpc.NewAgentServer(st, agentManager, logger)
 
 	agentServer.SetPolicyPusher(policyPusher)
+
+	// Create the organisation's default account on a machine the first time
+	// it connects. On connect rather than at registration, because
+	// registration happens before the agent has a command stream to receive
+	// anything on.
+	agentServer.SetOnMachineConnected(h.ApplyDefaultUser)
 	agentServer.SetTerminalManager(h.GetTerminalManager()) // Wire terminal manager
 	agentServer.SetRDPHandler(rdpManager)                  // Route rdp_ session output to RDP tunnels
 	agentServer.SetRemoteControlHandler(rcManager)         // Route rc_ session output to remote control
@@ -496,6 +514,36 @@ func main() {
 		auth.GET("/applications/catalog", h.GetAppCatalog)
 		auth.POST("/applications/scan", h.RequestFleetInventoryScan)
 		auth.GET("/applications/machines", h.GetMachinesWithApp)
+
+		// Local-account inventory: who exists on each machine and who holds
+		// administrator rights. Read-only, and deliberately so — this is the
+		// evidence least-privilege policy will be written from, and no
+		// endpoint is changed by anything here.
+		auth.GET("/machines/:agent_id/accounts", h.GetMachineAccounts)
+		auth.POST("/machines/:agent_id/accounts/scan", h.RequestMachineAccountScan)
+		auth.POST("/machines/:agent_id/accounts", h.CreateMachineAccount)
+		auth.POST("/machines/:agent_id/account-action", h.ManageMachineAccount)
+		auth.GET("/accounts", h.GetFleetAccounts)
+
+		// Least-privilege policies: who may hold local administrator rights.
+		// Their own enforcement switch, separate from application control —
+		// sharing one would mean enabling application blocking also strips
+		// administrator rights across the fleet.
+		auth.GET("/privilege-policies", h.ListPrivilegePolicies)
+		auth.POST("/privilege-policies", h.CreatePrivilegePolicy)
+		auth.POST("/privilege-policies/simulate", h.SimulatePrivilegePolicy)
+		auth.GET("/privilege-policies/:id", h.GetPrivilegePolicy)
+		auth.PUT("/privilege-policies/:id", h.UpdatePrivilegePolicy)
+		auth.DELETE("/privilege-policies/:id", h.DeletePrivilegePolicy)
+		// Fleet-wide configuration. Super administrator only — it reaches
+		// machines that have not been enrolled yet, and every agent at once.
+		auth.GET("/fleet-config", h.GetFleetConfig)
+		auth.PUT("/fleet-config", h.SaveFleetConfig)
+		auth.POST("/fleet-config/upgrade-agents", h.UpgradeFleet)
+		auth.POST("/fleet-config/apply-default-user", h.ApplyDefaultUserToExisting)
+
+		auth.GET("/privilege-control/settings", h.GetPrivilegeSettings)
+		auth.PUT("/privilege-control/settings", h.SetPrivilegeEnforcement)
 
 		// Application-control policies. Authored and projected in Phase A;
 		// enforcementEnabled in internal/api/policies.go is false, so nothing

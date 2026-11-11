@@ -47,9 +47,9 @@ func TestAPolicyPinnedToAnOldEnrolmentReachesNobody(t *testing.T) {
 func TestTheReachCountAgreesWithTheResolver(t *testing.T) {
 	tenantWide := &store.AppPolicy{
 		Name: "Everywhere", Enabled: true,
-		Scope:   store.PolicyScope{Kind: store.PolicyScopeTenant},
-		Rules:   []store.PolicyRule{{Name: "r", Enabled: true, Action: store.ActionBlock}},
-		Mode:    store.ModeEnforce,
+		Scope: store.PolicyScope{Kind: store.PolicyScopeTenant},
+		Rules: []store.PolicyRule{{Name: "r", Enabled: true, Action: store.ActionBlock}},
+		Mode:  store.ModeEnforce,
 	}
 	m := &store.Machine{AgentID: "a1", TenantID: "t"}
 

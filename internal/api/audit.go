@@ -280,8 +280,12 @@ func notYetRecorded(enforcing bool) []string {
 	}
 	return append(gaps,
 		"Application control does not intercept execution at the kernel. A launch is prevented by the operating system's own facilities (Image File Execution Options on Windows, withholding the execute bit on macOS) and a running program is terminated; both are reversible by a user who holds administrator rights on the machine. Where a policy asks for removal, the software is MOVED to an agent-controlled directory rather than deleted, and is restored if the policy changes or the agent is removed.",
-		"Sudo command activity — sudo management is not implemented.",
-		"Local administrator rights — least-privilege enforcement is not implemented.",
+		"Local administrator rights are enforced on macOS and Windows. Linux endpoints report their accounts but none are demoted there, so a figure of zero demotions on a Linux machine means the platform is not covered, not that the machine had nothing to remove.",
+		"Commands a demoted user may still run with elevated rights work differently on each platform, and the audit trail differs with them. On macOS and Linux they are granted through sudoers and the person runs the command as their own process; individual invocations are NOT recorded here. On Windows the agent runs the command on their behalf and every invocation IS recorded, with its exit code and output. A machine with no entries is therefore not necessarily a machine where nothing was run.",
+		"A command brokered on Windows runs as the SYSTEM account, not as the requesting user with elevated rights — Windows provides no way to elevate a standard user's own token. It therefore does not see that user's profile, mapped drives or per-user settings.",
+		"Directory accounts (Entra, Active Directory) that hold local administrator rights are reported and are never demoted: removing their rights is a directory operation this product does not perform. They are listed in the account inventory and counted as administrators.",
+		"Removing administrator rights is refused outright on any machine where it would leave no administrator at all, and on any machine where more accounts would be demoted in one pass than the safety limit allows. Those refusals are recorded; a machine that refused is NOT a machine that complied.",
+		"Sudo command activity — the commands a demoted user may run as root are written to the endpoint and recorded here when they change, but individual sudo invocations are not yet captured.",
 		"Just-in-time approvals — the request model exists but the workflow is not switched on.",
 		"Portal sign-ins and user management are recorded separately by the authentication service and are not included here.",
 	)

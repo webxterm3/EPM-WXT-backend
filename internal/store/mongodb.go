@@ -27,9 +27,13 @@ type MongoDB struct {
 	AccessRequests       *mongo.Collection
 	AccessEvents         *mongo.Collection
 	InstalledApps        *mongo.Collection
+	LocalAccounts        *mongo.Collection
 	InventoryScans       *mongo.Collection
 	AppPolicies          *mongo.Collection
 	AppControlSettings   *mongo.Collection
+	PrivilegePolicies    *mongo.Collection
+	PrivilegeSettings    *mongo.Collection
+	FleetConfigs         *mongo.Collection
 	EnforcementEvents    *mongo.Collection
 	NotificationClaims   *mongo.Collection
 	RemoteAccessPolicies *mongo.Collection
@@ -65,9 +69,13 @@ func NewMongoDB(uri, dbName string) (*MongoDB, error) {
 		AccessRequests:       db.Collection("access_requests"),
 		AccessEvents:         db.Collection("access_events"),
 		InstalledApps:        db.Collection("installed_apps"),
+		LocalAccounts:        db.Collection("local_accounts"),
 		InventoryScans:       db.Collection("inventory_scans"),
 		AppPolicies:          db.Collection("app_policies"),
 		AppControlSettings:   db.Collection("app_control_settings"),
+		PrivilegePolicies:    db.Collection("privilege_policies"),
+		PrivilegeSettings:    db.Collection("privilege_settings"),
+		FleetConfigs:         db.Collection("fleet_configs"),
 		EnforcementEvents:    db.Collection("enforcement_events"),
 		NotificationClaims:   db.Collection("notification_claims"),
 		RemoteAccessPolicies: db.Collection("remote_access_policies"),
@@ -201,6 +209,47 @@ func (m *MongoDB) ensureIndexes(ctx context.Context) error {
 		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "scope.group_ids", Value: 1}}, Options: options.Index().SetSparse(true)},
 		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "scope.agent_ids", Value: 1}}, Options: options.Index().SetSparse(true)},
 		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "name", Value: 1}}, Options: options.Index().SetUnique(true)},
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = m.PrivilegePolicies.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "enabled", Value: 1}}},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "scope.group_ids", Value: 1}}, Options: options.Index().SetSparse(true)},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "scope.agent_ids", Value: 1}}, Options: options.Index().SetSparse(true)},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "name", Value: 1}}, Options: options.Index().SetUnique(true)},
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = m.PrivilegeSettings.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}}, Options: options.Index().SetUnique(true)},
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = m.FleetConfigs.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}}, Options: options.Index().SetUnique(true)},
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = m.LocalAccounts.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		// The reconcile key. Unique, so a repeated snapshot cannot create a
+		// second row for the same account.
+		{Keys: bson.D{{Key: "agent_id", Value: 1}, {Key: "account_key", Value: 1}}, Options: options.Index().SetUnique(true)},
+		// The per-machine listing.
+		{Keys: bson.D{{Key: "machine_id", Value: 1}, {Key: "present", Value: 1}, {Key: "username_lower", Value: 1}}},
+		// The question the whole collection exists to answer: who holds
+		// local administrator rights across this tenant's fleet.
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "is_admin", Value: 1}, {Key: "present", Value: 1}}},
+		// "which of those could policy actually act on", which is the number
+		// a rollout is sized against and is not the same as the one above.
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "demotable", Value: 1}, {Key: "present", Value: 1}}},
 	})
 	if err != nil {
 		return err
@@ -1842,6 +1891,44 @@ func (m *MongoDB) ApprovedInstallRequest(agentID, application string) (*AccessRe
 
 // ApprovedInstallsForMachine filters in the database on the machine, so no
 // other machine's approvals can crowd this one's out of a page.
+// ApprovedAdminAccessForMachine is every live approval of administrator
+// rights on ONE machine.
+//
+// Its own query rather than a filter over ApprovedInstallsForMachine, which
+// asks the database for requests carrying an app_install ask and would
+// therefore never return one of these. That is not a theoretical difference:
+// written as a filter, the just-in-time admin grant would push an empty list
+// on every machine forever, the approval would look granted in the portal,
+// and nothing would change on the endpoint — which is the exact failure this
+// whole piece of work exists to fix.
+func (m *MongoDB) ApprovedAdminAccessForMachine(agentID string) ([]*AccessRequest, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Only "approved" here, unlike the install query.
+	//
+	// "completed" is the terminal state of an install-only request — the
+	// software went on, and the permission outlives it. An administrator
+	// grant has no equivalent: there is no moment at which it has been "used"
+	// and should go on applying. It ends when ExpiresAt says so, or when
+	// somebody revokes it.
+	cursor, err := m.AccessRequests.Find(ctx, bson.M{
+		"status":            "approved",
+		"machine_agent_id":  agentID,
+		"asks.admin_access": bson.M{"$exists": true},
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var reqs []*AccessRequest
+	if err := cursor.All(ctx, &reqs); err != nil {
+		return nil, err
+	}
+	return reqs, nil
+}
+
 func (m *MongoDB) ApprovedInstallsForMachine(agentID string) ([]*AccessRequest, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

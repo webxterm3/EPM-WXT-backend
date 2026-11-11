@@ -137,6 +137,10 @@ func (m *RemoteControlManager) HandleAgentData(sessionID string, data []byte) {
 		m.sessions[agentID] = s
 	}
 
+	// portlessActive records a session that claimed to be ready with nothing
+	// to connect to, so a reason can be attached below.
+	portlessActive := false
+
 	if msg.State != "" {
 		// ACTIVE needs a port to be worth anything.
 		//
@@ -152,7 +156,22 @@ func (m *RemoteControlManager) HandleAgentData(sessionID string, data []byte) {
 		// connected to. Neither means not ready, and not ready is a state
 		// the console already handles.
 		if msg.State == rcStateActive && msg.Port == 0 && s.Port == 0 {
-			m.logger.Warn("Ignoring an active remote-control state with no port",
+			// Recorded as an ERROR rather than ignored.
+			//
+			// Ignoring it left the session on whatever state it already had
+			// — usually awaiting_consent — so the console went on polling
+			// for a session that was never going to arrive, and the operator
+			// was left watching a spinner with nothing to act on.
+			//
+			// The agent downgrades this case itself now, so reaching here
+			// means an older agent or something genuinely wrong. Either way,
+			// saying so beats hanging.
+			s.State = rcStateError
+			// The reason is attached further down, after the message's own
+			// error field has been copied across — that assignment is
+			// unconditional and would otherwise wipe this.
+			portlessActive = true
+			m.logger.Warn("A remote-control session reported active with no port",
 				zap.String("agent_id", agentID),
 				zap.String("session", msg.SessionID))
 		} else {
@@ -179,6 +198,11 @@ func (m *RemoteControlManager) HandleAgentData(sessionID string, data []byte) {
 	s.Error = msg.Error
 	if s.Error == "" && msg.Message != "" && isFailureState(msg.State) {
 		s.Error = msg.Message
+	}
+	if portlessActive && s.Error == "" {
+		// Last, so the message's own error wins when it has one — the agent
+		// usually knows better than this generic sentence why it failed.
+		s.Error = "the machine reported a session but gave no port to connect to"
 	}
 	if s.State == rcStateActive && s.StartedAt.IsZero() {
 		s.StartedAt = time.Now()
@@ -215,6 +239,22 @@ func (m *RemoteControlManager) HandleAgentData(sessionID string, data []byte) {
 // SMTP is configured the send is a no-op, which is the right default for an
 // optional alert.
 func (m *RemoteControlManager) notifySessionStarted(agentID, operator string, viewOnly bool, at time.Time) {
+	// This runs in a goroutine nobody waits on, so a panic here does not fail
+	// a request — it takes the whole server down, every session on it, mid
+	// remote-control. For a function whose own contract is "an optional alert
+	// must not affect the session it is reporting on", being able to do that
+	// is the one thing it must not be able to do.
+	defer func() {
+		if r := recover(); r != nil {
+			m.logger.Error("Remote control: the session-started alert panicked",
+				zap.String("agent_id", agentID), zap.Any("panic", r))
+		}
+	}()
+
+	if m.store == nil {
+		return
+	}
+
 	machine, err := m.store.GetMachineByAgentID(agentID)
 	if err != nil || machine == nil {
 		return
@@ -252,20 +292,31 @@ func (m *RemoteControlManager) reap() {
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
 	for range t.C {
-		cutoff := time.Now().Add(-rcSessionTTL)
+		live, expired := m.sweepOnce(time.Now().Add(-rcSessionTTL))
 
-		var expired []string
-		m.mu.Lock()
-		for id, s := range m.sessions {
-			if s.State != rcStateActive && s.UpdatedAt.Before(cutoff) {
-				delete(m.sessions, id)
+		// An active session whose agent is gone is not an active session.
+		//
+		// This is the one case nothing else cleaned up. A session only leaves
+		// the active state when somebody stops it or the policy cap fires —
+		// and the cap is optional, so with no cap set, a machine that slept,
+		// crashed or dropped off the network left a record that lived until
+		// the server was restarted. Every later attempt to connect to that
+		// machine was refused with "a session is already in progress", and
+		// the only cure anybody found was restarting the backend.
+		//
+		// The agent connection is a decisive signal rather than a guess: the
+		// remote-control tunnel rides that same gRPC stream, so a session
+		// cannot survive its loss.
+		//
+		// Checked outside the lock — IsAgentConnected takes the agent
+		// manager's own mutex, and holding this one across it is how two
+		// locks learn to deadlock.
+		for _, agentID := range live {
+			if m.am.IsAgentConnected(agentID) {
 				continue
 			}
-			if m.overRunning(s) {
-				expired = append(expired, id)
-			}
+			m.abandon(agentID)
 		}
-		m.mu.Unlock()
 
 		// Sent outside the lock: the send goes over the agent stream and
 		// holding the manager's mutex across it would stall every other
@@ -274,6 +325,56 @@ func (m *RemoteControlManager) reap() {
 			m.endOverrunningSession(agentID)
 		}
 	}
+}
+
+// sweepOnce drops the sessions that have plainly finished and reports the
+// rest for a closer look.
+//
+// Split out of reap so the decision can be tested without a ticker and
+// without an agent manager. What it returns is as much the point as what it
+// deletes: `live` is every session still claiming to be active, which the
+// caller then checks against the agent's actual connection.
+func (m *RemoteControlManager) sweepOnce(cutoff time.Time) (live, expired []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for id, s := range m.sessions {
+		if s.State != rcStateActive && s.UpdatedAt.Before(cutoff) {
+			delete(m.sessions, id)
+			continue
+		}
+		if m.overRunning(s) {
+			expired = append(expired, id)
+			continue
+		}
+		if s.State == rcStateActive {
+			live = append(live, id)
+		}
+	}
+	return live, expired
+}
+
+// abandon clears a session whose machine is no longer reachable.
+//
+// The agent is not told: it is not connected, which is the whole reason this
+// is being called. When it comes back it starts from idle — the agent clears
+// its own session state on disconnect — so there is nothing to undo.
+func (m *RemoteControlManager) abandon(agentID string) {
+	m.mu.Lock()
+	s := m.sessions[agentID]
+	if s == nil || s.State != rcStateActive {
+		// Something changed while the lock was released. Leave it alone
+		// rather than acting on the picture this goroutine started with.
+		m.mu.Unlock()
+		return
+	}
+	viewer := s.Viewer
+	delete(m.sessions, agentID)
+	m.mu.Unlock()
+
+	m.logger.Info("Remote control: cleared a session whose machine went away",
+		zap.String("agent_id", agentID),
+		zap.String("viewer", viewer))
 }
 
 // overRunning reports whether an active session has outlived its policy cap.
@@ -535,13 +636,14 @@ func (h *Handler) StopRemoteControl(c *gin.Context) {
 			zap.String("agent_id", agentID), zap.Error(err))
 	}
 
+	// The record is REMOVED, not marked idle.
+	//
+	// An idle husk still carries the viewer's name, the reason they gave and
+	// a start time, and the status endpoint returns all of it — so the portal
+	// goes on describing a session that is over. Removing it makes the status
+	// endpoint answer "idle" cleanly, which is what a stopped session is.
 	m.mu.Lock()
-	if s := m.sessions[agentID]; s != nil {
-		s.State = rcStateIdle
-		s.Port = 0
-		s.Password = ""
-		s.UpdatedAt = time.Now()
-	}
+	delete(m.sessions, agentID)
 	m.mu.Unlock()
 
 	h.record(c, auditEntry{

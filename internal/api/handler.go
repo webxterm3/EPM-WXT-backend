@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/vsay/vsay-agent-backend/internal/approvers"
 	"github.com/vsay/vsay-agent-backend/internal/grpc"
+	"github.com/vsay/vsay-agent-backend/internal/secret"
 	"github.com/vsay/vsay-agent-backend/internal/store"
 	"github.com/vsay/vsay-agent-backend/internal/upload"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -31,8 +32,19 @@ type Handler struct {
 	// which lives in vsay-auth because that is where groups and their
 	// administrators are. Stateless and safe to share.
 	approvers *approvers.Service
-	logger    *zap.Logger
+
+	// sealer encrypts the few values this service has to store and read back
+	// — at present only the default account's password. Nil when no key is
+	// configured, which disables those features rather than storing a
+	// credential for every machine in the fleet in the clear.
+	sealer *secret.Sealer
+
+	logger *zap.Logger
 }
+
+// SetSealer wires in the secret sealer. Nil is a valid state and means the
+// features that need stored credentials are unavailable.
+func (h *Handler) SetSealer(s *secret.Sealer) { h.sealer = s }
 
 // SetPolicyPusher wires in the shared policy resolver/pusher.
 func (h *Handler) SetPolicyPusher(p *grpc.PolicyPusher) {
