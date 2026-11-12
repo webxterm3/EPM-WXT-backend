@@ -86,7 +86,9 @@ ENV MONGO_URI=mongodb+srv://kaal:kaal123@machine.7vzoy0a.mongodb.net/?appName=ma
     SERVER_DOMAIN=agent.webxterm.me \
     GATEWAY_SECRET=vsay-gateway-super-secret-token-change-in-production-2026 \
     GUACD_ADDR=127.0.0.1:4822 \
-    GUACD_HOST_GATEWAY=127.0.0.1
+    GUACD_HOST_GATEWAY=127.0.0.1 \
+    CONFIG_ENCRYPT_KEY=gJy7AE2RJdYpGbjSqQOYXtBfjadMtz37tS0BgayX4Is= \
+    WXT_LOG_MANAGER_URL=http://localhost:8090
 
 # HTTP, HTTPS, gRPC
 EXPOSE 8080 8443 8081
